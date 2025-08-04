@@ -31,10 +31,10 @@ Kairos introduces a perpetual, autonomous improvement cycle built on three core 
 ## Core Features
 
 *   **Expertise Distillation Engine:** Solve the cold-start problem by bootstrapping your new agent with the distilled wisdom from years of your own historical call logs. Achieve high performance from day one.
-*   ⚡ **Real-time Adaptation Engine:** Our live learning loop never stops. The contextual bandit ensures your agent is always using the optimal strategy for any given user or situation, adapting its behavior in milliseconds.
+*   **Real-time Adaptation Engine:** Our live learning loop never stops. The contextual bandit ensures your agent is always using the optimal strategy for any given user or situation, adapting its behavior in milliseconds.
 *   **Proactive Opportunity Engine:** Kairos doesn't just optimize—it innovates. We analyze conversations to proactively suggest new, data-driven product offerings and process improvements for your business.
 
-## 🛠️ Technology Stack
+## Technology Stack
 
 *   **Backend:** FastAPI (Python) & Celery
 *   **Frontend:** Next.js (TypeScript) & Tailwind CSS
