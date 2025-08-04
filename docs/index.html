@@ -9,36 +9,39 @@
     <link rel="stylesheet" href="style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     
-    <!-- You can generate a favicon here: https://favicon.io/ -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡️</text></svg>">
 </head>
 <body>
+    <!-- Floating particles -->
+    <div class="particles"></div>
+
+    <nav>
+        <div class="container">
+            <div class="logo">Kairos</div>
+        </div>
+    </nav>
 
     <header class="hero">
         <div class="container">
-            <nav>
-                <div class="logo">Kairos</div>
-            </nav>
-            <h1>Stop Tweaking. Start Learning.</h1>
-            <p class="subtitle">Kairos is the intelligence layer that turns static voice agents into self-optimizing assets. The Amplitude for Voice AI, with a built-in autopilot.</p>
-            <a href="YOUR_TALLY_FORM_URL_HERE" target="_blank" class="cta-button">Join the Waitlist</a>
-            <div class="social-proof">
-                <p>Backed by Y Combinator</p>
+            <div class="hero-content">
+                <h1>Stop Tweaking. Start Learning.</h1>
+                <p class="subtitle">Kairos is the intelligence layer that turns static voice agents into self-optimizing assets. The Amplitude for Voice AI, with a built-in autopilot.</p>
+                <a href="https://tally.so/r/mR9P14" target="_blank" class="cta-button">Join the Waitlist</a>
             </div>
         </div>
     </header>
 
     <main>
-        <section class="problem">
+        <section class="problem animate-on-scroll">
             <div class="container">
                 <h2>Static Prompts Don't Survive in the Wild.</h2>
                 <p>You spend weeks perfecting a prompt, but the real world is messy. Static agents can't adapt to different user personalities and edge cases, leading to performance plateaus and endless manual fixes. Your agent's potential is capped from day one.</p>
             </div>
         </section>
 
-        <section class="solution">
+        <section class="solution animate-on-scroll">
             <div class="container">
                 <h2>The Kairos Learning Loop</h2>
                 <div class="steps-grid">
@@ -58,7 +61,7 @@
             </div>
         </section>
 
-        <section class="features">
+        <section class="features animate-on-scroll">
             <div class="container">
                 <div class="feature-grid">
                     <div class="feature-card">
@@ -77,12 +80,11 @@
             </div>
         </section>
 
-        <section class="developer">
+        <section class="developer animate-on-scroll">
             <div class="container">
                 <h2>Powerful Intelligence, Simple Integration.</h2>
                 <p>Our open-source Python SDK is designed to fit into any existing agentic framework. Get started with just a few lines of code.</p>
-                <pre><code>
-from kairos_agent_sdk import KairosClient
+                <pre><code>from kairos_agent_sdk import KairosClient
 
 # Initialize the client
 kairos = KairosClient(api_key="kai_...")
@@ -94,16 +96,15 @@ strategy = kairos.get_strategy(context={...})
 kairos.record_outcome(
     interaction_id=strategy.interaction_id,
     metrics={"booking_confirmed": True}
-)
-                </code></pre>
+)</code></pre>
             </div>
         </section>
 
-        <section class="final-cta">
+        <section class="final-cta animate-on-scroll">
             <div class="container">
                 <h2>It's time for your agents to learn.</h2>
                 <p>Be the first to build agents that truly self-improve. Join the waitlist for early access to Kairos.</p>
-                <a href="YOUR_TALLY_FORM_URL_HERE" target="_blank" class="cta-button">Join the Waitlist</a>
+                <a href="https://tally.so/r/mR9P14" target="_blank" class="cta-button">Join the Waitlist</a>
             </div>
         </section>
     </main>
