@@ -1,0 +1,128 @@
+:root {
+    --background-color: #0A0A0A;
+    --text-color: #EAEAEA;
+    --primary-color: #4F46E5; /* Indigo */
+    --secondary-color: #27272A;
+    --border-color: #3f3f46;
+}
+
+body {
+    background-color: var(--background-color);
+    color: var(--text-color);
+    font-family: 'Inter', sans-serif;
+    margin: 0;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 2rem;
+}
+
+section {
+    padding: 6rem 0;
+    text-align: center;
+}
+
+h1, h2, h3, h4 {
+    font-weight: 700;
+}
+
+h1 {
+    font-size: 3.5rem;
+    line-height: 1.1;
+    margin-bottom: 1.5rem;
+}
+
+h2 {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+}
+
+.subtitle, .problem p, .solution p, .features p, .developer p, .final-cta p {
+    max-width: 650px;
+    margin: 0 auto;
+    color: #A1A1AA;
+    font-size: 1.1rem;
+}
+
+/* Hero Section */
+.hero {
+    padding: 6rem 0;
+    text-align: center;
+    border-bottom: 1px solid var(--border-color);
+}
+.logo {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 4rem;
+}
+.cta-button {
+    display: inline-block;
+    background-color: var(--primary-color);
+    color: white;
+    padding: 0.8rem 2rem;
+    border-radius: 6px;
+    text-decoration: none;
+    font-weight: 600;
+    margin-top: 2rem;
+    transition: background-color 0.2s ease;
+}
+.cta-button:hover {
+    background-color: #4338CA;
+}
+.social-proof {
+    margin-top: 4rem;
+    color: #71717A;
+}
+
+/* Solution & Features Section */
+.steps-grid, .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 2rem;
+    margin-top: 4rem;
+    text-align: left;
+}
+.step-card, .feature-card {
+    background-color: var(--secondary-color);
+    padding: 2rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+.feature-card h4 { font-size: 1.2rem; }
+
+/* Developer Section */
+pre {
+    background-color: #18181B;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+    text-align: left;
+    max-width: 650px;
+    margin: 2rem auto 0 auto;
+    overflow-x: auto;
+}
+code {
+    font-family: 'SF Mono', 'Fira Code', 'monospace';
+    font-size: 0.9rem;
+    color: #D4D4D8;
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 2rem 0;
+    border-top: 1px solid var(--border-color);
+    color: #71717A;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    h1 { font-size: 2.5rem; }
+    h2 { font-size: 2rem; }
+    .steps-grid, .feature-grid {
+        grid-template-columns: 1fr;
+    }
+}
