@@ -1,0 +1,29 @@
+# Note: The 'version' key is obsolete and has been removed as recommended.
+services:
+  api:
+    build: .
+    container_name: kairos_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the entire directory for hot-reloading. This is safe now
+      # because the dependencies are installed system-wide in the container.
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    # The command is simple because uvicorn is now globally available in the container's PATH.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  redis:
+    image: redis:7-alpine
+    container_name: kairos_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

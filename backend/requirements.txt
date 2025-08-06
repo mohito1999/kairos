@@ -1,0 +1,31 @@
+# FastAPI & Server
+fastapi
+uvicorn[standard]
+
+# Database & ORM
+sqlalchemy[asyncio]
+asyncpg
+alembic
+psycopg2-binary # For Alembic's sync operations
+
+# Data Validation & Settings
+pydantic
+pydantic-settings
+email-validator
+
+# Authentication & Security
+python-jose[cryptography]
+passlib[bcrypt]
+
+# Asynchronous Tasks
+celery
+redis
+
+# AI & ML
+openai
+pgvector-python
+sentence-transformers
+scikit-learn
+
+# Supabase Client
+supabase
