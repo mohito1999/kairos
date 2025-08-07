@@ -23,12 +23,8 @@ if config.config_file_name is not None:
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
 # Import the Base for metadata
-from app.models.base import Base
-
-# Import all your models here so Alembic can see them for autogenerate
-from app.models import organization, user, agent, agent_api_key, interaction, outcome
-from app.models import learned_pattern, experiment, historical_upload, historical_interaction
-from app.models import suggested_opportunity, plan, plan_feature
+# Import the Base for metadata and all models via the central __init__.py
+from app.models import Base
 
 # Point Alembic to your models' metadata
 target_metadata = Base.metadata

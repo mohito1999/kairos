@@ -1,10 +1,17 @@
 import uuid
+import pandas as pd
+import tempfile
+import shutil
+import os
+import asyncio
+from io import StringIO
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload, Session
 from contextlib import contextmanager
+from datetime import datetime, timezone 
 
 from app.core.celery_app import celery_app
-from app.database import SyncSessionLocal # Import the sync session maker
+from app.database import SyncSessionLocal, AsyncSessionLocal
 
 # Import all models needed for the tasks
 from app.models.historical_upload import HistoricalUpload
@@ -57,31 +64,76 @@ def extract_patterns_from_history_task(upload_id: str):
 
 
 @celery_app.task
-def process_historical_upload_task(upload_id: str):
+def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     """
-    Processes a historical data file and then triggers the pattern extraction task.
-    Uses synchronous SQLAlchemy operations.
+    Processes a historical data file from in-memory bytes.
+    Parses the CSV, creates HistoricalInteraction records, and triggers pattern extraction.
     """
-    print(f"Starting to process historical upload with ID: {upload_id}")
-    with get_sync_db_session() as db:
-        upload = db.get(HistoricalUpload, uuid.UUID(upload_id))
-        if not upload: return
+    async def _run():
+        async with AsyncSessionLocal() as db:
+            print(f"Starting to process historical upload with ID: {upload_id}")
+            upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
+            if not upload:
+                print(f"Upload {upload_id} not found.")
+                return
 
-        # SIMULATION...
-        dummy_interactions = [
-            HistoricalInteraction(upload_id=upload.id, original_context={"customer_type": "honeymoon"}, original_response="For a romantic trip, try our Couple's Paradise package.", is_success=True),
-            HistoricalInteraction(upload_id=upload.id, original_context={"customer_type": "family"}, original_response="The Adventurous Family package is great for kids.", is_success=True),
-        ]
-        db.add_all(dummy_interactions)
-        
-        upload.status = "COMPLETED"
-        upload.total_interactions = len(dummy_interactions)
-        upload.processed_interactions = len(dummy_interactions)
-        
-        print(f"Successfully processed and updated status for upload ID: {upload_id}")
-        
-        # Trigger the next step in the pipeline after the session commits
-        extract_patterns_from_history_task.delay(upload_id)
+            try:
+                # Use pandas to read the CSV content from the in-memory bytes
+                csv_content = file_content_bytes.decode('utf-8')
+                df = pd.read_csv(StringIO(csv_content))
+
+                interactions_to_create = []
+                for index, row in df.iterrows():
+                    # Dynamically build the context object from the mapping
+                    context = {}
+                    for key, value in data_mapping.items():
+                        if key.startswith("context_") and value in row:
+                            context_key = key.replace("context_", "")
+                            context[context_key] = row[value]
+                    
+                    # Determine outcome
+                    is_success = False
+                    outcome_column = data_mapping.get("outcome")
+                    if outcome_column and outcome_column in row:
+                        # Simple success check, can be made more robust
+                        is_success = str(row[outcome_column]).lower() in ['true', 'success', '1', 'yes']
+                    
+                    # Get transcript/response
+                    transcript_column = data_mapping.get("conversation_transcript")
+                    response_text = row.get(transcript_column, "")
+
+                    interactions_to_create.append(
+                        HistoricalInteraction(
+                            upload_id=upload.id,
+                            original_context=context,
+                            original_response=response_text,
+                            is_success=is_success,
+                            extracted_outcome={"outcome": str(row.get(outcome_column, ''))}
+                        )
+                    )
+                
+                # Bulk insert all interactions for efficiency
+                db.add_all(interactions_to_create)
+
+                upload.status = "COMPLETED"
+                upload.total_interactions = len(df)
+                upload.processed_interactions = len(df)
+                upload.processing_completed_timestamp = datetime.now(timezone.utc)
+                print(f"Successfully parsed {len(df)} interactions from file.")
+
+            except Exception as e:
+                print(f"Error processing file for upload {upload.id}: {e}")
+                upload.status = "FAILED"
+            
+            await db.commit()
+            
+            if upload.status == "COMPLETED":
+                print(f"Triggering pattern extraction for upload ID: {upload_id}")
+                extract_patterns_from_history_task.delay(upload_id)
+
+    # We must import StringIO for this task
+    from io import StringIO
+    return asyncio.run(_run())
 
 
 @celery_app.task
