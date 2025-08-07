@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api.v1.endpoints import users
+from app.api.v1.endpoints import users, agents, api_keys
 
 app = FastAPI(
     title="Kairos API",
@@ -7,7 +7,9 @@ app = FastAPI(
     version="0.1.0"
 )
 
-app.include_router(users.router, prefix="/api/v1/users", tags=["Users"]) # Add this line
+app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
+app.include_router(agents.router, prefix="/api/v1/agents", tags=["Agents"])
+app.include_router(api_keys.router, prefix="/api/v1/api-keys", tags=["API Keys"])
 
 @app.get("/health", tags=["Health"])
 def health_check():
