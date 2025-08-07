@@ -14,3 +14,5 @@ from app.models.experiment import Experiment
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
 from app.models.suggested_opportunity import SuggestedOpportunity
+from app.models.plan import Plan
+from app.models.plan_feature import PlanFeature
