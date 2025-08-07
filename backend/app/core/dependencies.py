@@ -1,4 +1,5 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Security
+from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from supabase_py_async import create_client
 from supabase_py_async.lib.client_options import ClientOptions
@@ -10,6 +11,35 @@ from app.models.user import User
 from app.services.user_service import get_user_by_supabase_id
 from app.schemas.user import UserCreate
 from app.services.user_service import create_user_with_organization
+from app.services.sdk_service import get_agent_from_api_key
+from app.models.agent import Agent
+
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+async def get_agent_from_sdk_auth(
+    api_key: str = Security(api_key_header),
+    db: AsyncSession = Depends(get_db),
+) -> Agent:
+    """
+    Dependency to authenticate and retrieve an agent via an API key.
+    The key is expected in the "Authorization" header, e.g., "Authorization: kai_...".
+    Note: We don't use "Bearer" here for SDK keys to distinguish them from user JWTs.
+    """
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header is missing",
+        )
+    
+    agent = await get_agent_from_api_key(db, api_key)
+    
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or inactive API Key",
+        )
+    return agent
+
 
 # This is a FastAPI dependency that will act as a "gatekeeper" for protected endpoints.
 async def get_current_user(
@@ -123,3 +153,27 @@ async def get_current_user_with_provisioining(
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+async def get_agent_from_sdk_auth(
+    api_key: str = Security(api_key_header),
+    db: AsyncSession = Depends(get_db),
+) -> Agent:
+    """
+    Dependency to authenticate and retrieve an agent via an API key.
+    The key is expected in the "Authorization" header, e.g., "Authorization: kai_...".
+    Note: We don't use "Bearer" here for SDK keys to distinguish them from user JWTs.
+    """
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header is missing",
+        )
+    
+    agent = await get_agent_from_api_key(db, api_key)
+    
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or inactive API Key",
+        )
+    return agent
