@@ -9,6 +9,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { RegisterAgentDialog } from "@/components/register-agent-form"
+import Link from "next/link";
 
 // Define a type for our agent data for type safety
 interface Agent {
@@ -82,10 +83,22 @@ export default async function AgentsPage() {
               </TableRow>
             ) : (
               agents.map((agent) => (
-                <TableRow key={agent.id}>
-                  <TableCell className="font-medium">{agent.name}</TableCell>
-                  <TableCell>{agent.objective}</TableCell>
-                  <TableCell>{new Date(agent.created_at).toLocaleDateString()}</TableCell>
+                <TableRow key={agent.id} className="cursor-pointer hover:bg-muted/50">
+                  <TableCell className="font-medium">
+                    <Link href={`/dashboard/agents/${agent.id}`} className="block">
+                      {agent.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>
+                    <Link href={`/dashboard/agents/${agent.id}`} className="block">
+                      {agent.objective}
+                    </Link>
+                  </TableCell>
+                  <TableCell>
+                    <Link href={`/dashboard/agents/${agent.id}`} className="block">
+                      {new Date(agent.created_at).toLocaleDateString()}
+                    </Link>
+                  </TableCell>
                   <TableCell className="text-right">
                     {/* Actions dropdown will go here */}
                   </TableCell>

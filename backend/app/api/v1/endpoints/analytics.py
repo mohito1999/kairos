@@ -10,7 +10,7 @@ from app.services import agent_service # We'll add analytics services later
 
 # For now, we will put the query logic directly in the endpoint.
 # In a larger app, this would be in a dedicated analytics_service.py.
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.learned_pattern import LearnedPattern
@@ -33,18 +33,22 @@ async def get_performance_over_time(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
         
-    # Example query: Get daily success rate for the last 30 days
-    # This is a complex query and a placeholder for what a real analytics query looks like.
+    # Define the date grouping expression once for clarity
+    date_series = func.date_trunc('day', Interaction.created_at).label('date')
+
     stmt = (
         select(
-            func.date_trunc('day', Interaction.created_at).label('date'),
-            func.count().label('total_interactions'),
-            func.sum(case((Outcome.is_success == True, 1), else_=0)).label('successful_interactions')
+            date_series,
+            func.count(Interaction.id).label('total_interactions'),
+            func.sum(
+                case((Outcome.is_success == True, 1), else_=0)
+            ).label('successful_interactions')
         )
+        .select_from(Interaction) # Explicitly state the FROM clause
         .join(Outcome, Interaction.id == Outcome.interaction_id)
         .where(Interaction.agent_id == agent_id)
-        .group_by(func.date_trunc('day', Interaction.created_at))
-        .order_by(func.date_trunc('day', Interaction.created_at))
+        .group_by(date_series) # Group by the labeled expression
+        .order_by(date_series.desc()) # Order by the labeled expression
         .limit(30)
     )
     
