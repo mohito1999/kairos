@@ -10,8 +10,8 @@ class UserBase(BaseModel):
 # Properties to receive on creation
 class UserCreate(UserBase):
     supabase_auth_id: uuid.UUID
-    organization_id: uuid.UUID
     role: str = "member"
+
 
 # Properties to receive on update
 class UserUpdate(BaseModel):

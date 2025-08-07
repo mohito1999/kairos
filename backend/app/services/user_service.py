@@ -17,10 +17,9 @@ async def get_user_by_supabase_id(db: AsyncSession, supabase_id: uuid.UUID) -> U
 async def create_user_with_organization(db: AsyncSession, user_in: UserCreate) -> User:
     """
     Creates a new user and their initial organization.
+    The organization_id is handled internally, not passed in.
     """
     # Create an organization for the new user.
-    # We'll name it based on their email for now. e.g., "John Doe's Organization"
-    # The user can rename it later in the UI.
     org_name = f"{user_in.email.split('@')[0]}'s Organization"
     new_organization = await create_organization(db, OrganizationCreate(name=org_name))
     
@@ -28,8 +27,9 @@ async def create_user_with_organization(db: AsyncSession, user_in: UserCreate) -
     new_user = User(
         email=user_in.email,
         supabase_auth_id=user_in.supabase_auth_id,
-        organization_id=new_organization.id,
-        full_name=user_in.full_name
+        organization_id=new_organization.id, # The ID comes from the new org
+        full_name=user_in.full_name,
+        role=user_in.role
     )
     db.add(new_user)
     await db.commit()

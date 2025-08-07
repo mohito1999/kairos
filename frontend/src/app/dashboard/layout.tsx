@@ -26,6 +26,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { signOut } from "./actions"
 
 export default function DashboardLayout({
   children,
@@ -52,7 +53,7 @@ export default function DashboardLayout({
                 Dashboard
               </Link>
               <Link
-                href="#"
+                href="/dashboard/agents"
                 className="flex items-center gap-3 rounded-lg px-3 py-2 text-muted-foreground transition-all hover:text-primary"
               >
                 <Package className="h-4 w-4" />
@@ -90,7 +91,13 @@ export default function DashboardLayout({
               <DropdownMenuItem>Settings</DropdownMenuItem>
               <DropdownMenuItem>Support</DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem>Logout</DropdownMenuItem>
+              <form action={signOut}>
+                <button type="submit" className="w-full text-left">
+                    <DropdownMenuItem>
+                    Logout
+                    </DropdownMenuItem>
+                </button>
+                </form>
             </DropdownMenuContent>
           </DropdownMenu>
         </header>
