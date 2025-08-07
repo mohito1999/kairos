@@ -7,7 +7,7 @@ from app.models.user import User
 from app.models.historical_upload import HistoricalUpload
 from app.core.dependencies import get_current_user_with_provisioining as get_current_user
 from app.database import get_db
-from app.background.tasks import process_historical_upload
+from app.background.tasks import process_historical_upload_task
 
 router = APIRouter()
 
@@ -45,7 +45,7 @@ async def upload_historical_data(
     await db.refresh(new_upload)
 
     # Queue the background job to process the file
-    process_historical_upload.delay(str(new_upload.id))
+    process_historical_upload_task.delay(str(new_upload.id))
     
     new_upload.status = "PROCESSING"
     await db.commit()

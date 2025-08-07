@@ -21,7 +21,7 @@ from app.core.dependencies import get_agent_from_sdk_auth
 from app.models.agent import Agent
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
-from app.background.tasks import process_live_outcome
+from app.background.tasks import process_live_outcome_task
 
 router = APIRouter()
 
@@ -116,7 +116,7 @@ async def record_interaction_outcome(
     db.add(new_outcome)
     await db.commit()
 
-    process_live_outcome.delay(str(request.interaction_id))
+    process_live_outcome_task.delay(str(request.interaction_id))
 
 
     return InteractionOutcomeResponse()
