@@ -5,7 +5,7 @@ import json
 # We use the OpenAI client, but point it to the OpenRouter base URL
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=settings.OPENROUTER_API_key,
+    api_key=settings.OPENROUTER_API_KEY,
 )
 
 async def get_json_response(system_prompt: str, user_prompt: str, model: str = "mistralai/mistral-7b-instruct:free"):
