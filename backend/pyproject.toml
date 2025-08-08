@@ -7,7 +7,7 @@ readme = "README.md"
 packages = [{include = "app"}]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<4.0"
+python = ">=3.11,<4.0"
 pgvector = ">=0.4.1,<0.5.0"
 uvicorn = {extras = ["standard"], version = ">=0.35.0,<0.36.0"}
 python-jose = {extras = ["cryptography"], version = ">=3.5.0,<4.0.0"}
@@ -30,6 +30,7 @@ openai = ">=1.99.1,<2.0.0"
 # I have removed it to keep dependencies clean.
 pandas = "^2.3.1"
 python-multipart = "^0.0.20"
+numpy = "^2.3.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"

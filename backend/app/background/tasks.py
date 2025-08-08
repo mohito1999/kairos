@@ -1,19 +1,18 @@
 import uuid
+import json
 import pandas as pd
-import tempfile
-import shutil
-import os
-import asyncio
 from io import StringIO
+from datetime import datetime, timezone
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload, Session
-from contextlib import contextmanager
-from datetime import datetime, timezone 
+from sqlalchemy.orm import selectinload
 
 from app.core.celery_app import celery_app
-from app.database import SyncSessionLocal, AsyncSessionLocal
+from contextlib import contextmanager
+from app.database import get_sync_db
 
-# Import all models needed for the tasks
+get_sync_db_session = contextmanager(get_sync_db)
+
+# Import all models
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
 from app.models.learned_pattern import LearnedPattern
@@ -21,120 +20,177 @@ from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.suggested_opportunity import SuggestedOpportunity
 
-# --- SYNCHRONOUS CELERY TASKS ---
+# Import services (note: these will need sync versions or careful handling)
+from app.services import embedding_service, llm_service
+import numpy as np
+from sklearn.cluster import DBSCAN
+import asyncio # We need asyncio only to run the async services
 
-@contextmanager
-def get_sync_db_session() -> Session:
-    """Provides a transactional scope around a series of operations."""
-    db = SyncSessionLocal()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+# --- SYNCHRONOUS CELERY TASKS ---
 
 
 @celery_app.task
 def extract_patterns_from_history_task(upload_id: str):
     """
-    Analyzes a completed historical upload to find and create patterns.
-    Uses synchronous SQLAlchemy operations.
+    Analyzes historical data using a more robust pattern finding logic.
     """
-    print(f"Starting pattern extraction for upload ID: {upload_id}")
+    print(f"Starting ADVANCED pattern extraction for upload ID: {upload_id}")
     with get_sync_db_session() as db:
-        stmt = select(HistoricalUpload).options(selectinload(HistoricalUpload.interactions)).where(HistoricalUpload.id == uuid.UUID(upload_id))
-        upload = db.execute(stmt).scalars().first()
-        if not upload: return
-
-        successful_interactions = [inter for inter in upload.interactions if inter.is_success]
-        patterns_found = {}
-        for inter in successful_interactions:
-            customer_type = (inter.original_context or {}).get("customer_type")
-            if customer_type and customer_type not in patterns_found:
-                patterns_found[customer_type] = inter.original_response
-
-        for context_summary, strategy in patterns_found.items():
-            new_pattern = LearnedPattern(agent_id=upload.agent_id, source="HISTORICAL", trigger_context_summary=context_summary, suggested_strategy=strategy, status="ACTIVE", impressions=1, success_count=1)
-            db.add(new_pattern)
+        stmt = select(HistoricalInteraction).options(selectinload(HistoricalInteraction.upload)).where(
+            HistoricalInteraction.upload_id == uuid.UUID(upload_id),
+            HistoricalInteraction.is_success == True
+        )
+        successful_interactions = db.execute(stmt).scalars().all()
         
-        print(f"Pattern extraction complete for upload ID: {upload_id}")
+        print(f"Found {len(successful_interactions)} successful interactions to analyze.")
+
+        if not successful_interactions:
+            return
+
+        # --- NEW, MORE ROBUST LOGIC ---
+        # Instead of complex clustering on a tiny dataset, we will use a simpler,
+        # more direct "group by" approach for the initial pattern discovery.
+        # This is more reliable for small amounts of data.
+
+        context_groups = {}
+        for inter in successful_interactions:
+            # We will group by the `customer_type` context key, if it exists.
+            customer_type = (inter.original_context or {}).get("customer_type")
+            if customer_type:
+                if customer_type not in context_groups:
+                    context_groups[customer_type] = []
+                context_groups[customer_type].append(inter)
+        
+        print(f"Grouped interactions into {len(context_groups)} context groups: {list(context_groups.keys())}")
+
+        if not context_groups:
+            print("Could not group interactions by a common context key. Exiting.")
+            return
+
+        # AI Service calls are async, so we run them in an event loop
+        async def perform_ai_abstraction():
+            patterns_to_create = []
+            for context_key, interactions_in_group in context_groups.items():
+                # Get a sample of successful responses from this group
+                sample_responses = [inter.original_response for inter in interactions_in_group[:5]]
+                
+                system_prompt = """
+                You are a data analyst. You will be given a list of successful agent responses that were all used in very similar situations. 
+                Your task is to identify the core strategy being used and to summarize the situation (the trigger).
+                Respond in a valid JSON format with two keys: "trigger_context_summary" and "suggested_strategy".
+                """
+                user_prompt = f"""
+                Here are some successful agent responses for a similar context:
+                ---
+                {json.dumps(sample_responses, indent=2)}
+                ---
+                Based on these, what is the core strategy, and what is a one-sentence summary of the context that triggers it?
+                """
+                
+                pattern_json = await llm_service.get_json_response(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model="openai/gpt-4o"
+                )
+
+                if pattern_json and "trigger_context_summary" in pattern_json and "suggested_strategy" in pattern_json:
+                    print(f"LLM abstracted new pattern for context: {context_key}")
+                    
+                    # We will create the object but not add it to the session yet
+                    patterns_to_create.append(
+                        LearnedPattern(
+                            agent_id=interactions_in_group[0].upload.agent_id, # Get agent_id from the interaction
+                            source="HISTORICAL",
+                            trigger_context_summary=pattern_json["trigger_context_summary"],
+                            suggested_strategy=pattern_json["suggested_strategy"],
+                            status="ACTIVE",
+                            impressions=len(interactions_in_group),
+                            success_count=len(interactions_in_group)
+                        )
+                    )
+            return patterns_to_create
+
+        # Run the async AI part
+        new_patterns = asyncio.run(perform_ai_abstraction())
+
+        # Now, back in the sync world, save the results
+        if new_patterns:
+            print(f"Saving {len(new_patterns)} new patterns to the database.")
+            db.add_all(new_patterns)
+            db.commit()
+        else:
+            print("No new patterns were generated by the LLM.")
+
 
 
 @celery_app.task
 def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     """
-    Processes a historical data file from in-memory bytes.
-    Parses the CSV, creates HistoricalInteraction records, and triggers pattern extraction.
+    Processes a historical data file using sync operations with robust parsing.
     """
-    async def _run():
-        async with AsyncSessionLocal() as db:
-            print(f"Starting to process historical upload with ID: {upload_id}")
-            upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
-            if not upload:
-                print(f"Upload {upload_id} not found.")
-                return
+    with get_sync_db_session() as db:
+        print(f"Starting to process historical upload with ID: {upload_id}")
+        upload = db.get(HistoricalUpload, uuid.UUID(upload_id))
+        if not upload: return
 
-            try:
-                # Use pandas to read the CSV content from the in-memory bytes
-                csv_content = file_content_bytes.decode('utf-8')
-                df = pd.read_csv(StringIO(csv_content))
+        try:
+            csv_content = file_content_bytes.decode('utf-8')
+            df = pd.read_csv(StringIO(csv_content))
 
-                interactions_to_create = []
-                for index, row in df.iterrows():
-                    # Dynamically build the context object from the mapping
-                    context = {}
-                    for key, value in data_mapping.items():
-                        if key.startswith("context_") and value in row:
-                            context_key = key.replace("context_", "")
-                            context[context_key] = row[value]
-                    
-                    # Determine outcome
-                    is_success = False
-                    outcome_column = data_mapping.get("outcome")
-                    if outcome_column and outcome_column in row:
-                        # Simple success check, can be made more robust
-                        is_success = str(row[outcome_column]).lower() in ['true', 'success', '1', 'yes']
-                    
-                    # Get transcript/response
-                    transcript_column = data_mapping.get("conversation_transcript")
-                    response_text = row.get(transcript_column, "")
+            print(f"Pandas DataFrame created with {len(df)} rows. Columns: {list(df.columns)}")
 
-                    interactions_to_create.append(
-                        HistoricalInteraction(
-                            upload_id=upload.id,
-                            original_context=context,
-                            original_response=response_text,
-                            is_success=is_success,
-                            extracted_outcome={"outcome": str(row.get(outcome_column, ''))}
-                        )
-                    )
+            interactions_to_create = []
+            
+            # --- ROBUST MAPPING AND PARSING LOGIC ---
+            outcome_col = data_mapping.get("outcome")
+            transcript_col = data_mapping.get("conversation_transcript")
+            context_cols = {key.replace("context_", ""): value for key, value in data_mapping.items() if key.startswith("context_")}
+
+            for index, row in df.iterrows():
+                # Build context object
+                context = {k: row.get(v) for k, v in context_cols.items() if v in row}
                 
-                # Bulk insert all interactions for efficiency
-                db.add_all(interactions_to_create)
+                # Robustly determine outcome
+                raw_outcome = ""
+                if outcome_col and outcome_col in row:
+                    raw_outcome = str(row[outcome_col]).strip().lower()
+                
+                is_success = raw_outcome in ['true', 'success', '1', 'yes']
+                
+                # Get transcript/response
+                response_text = ""
+                if transcript_col and transcript_col in row:
+                    response_text = str(row[transcript_col])
 
-                upload.status = "COMPLETED"
-                upload.total_interactions = len(df)
-                upload.processed_interactions = len(df)
-                upload.processing_completed_timestamp = datetime.now(timezone.utc)
-                print(f"Successfully parsed {len(df)} interactions from file.")
+                # DEBUG LOGGING: Print what we've parsed for each row
+                print(f"Row {index}: Raw Outcome='{raw_outcome}', Parsed Success={is_success}, Context={context}")
 
-            except Exception as e:
-                print(f"Error processing file for upload {upload.id}: {e}")
-                upload.status = "FAILED"
+                interactions_to_create.append(
+                    HistoricalInteraction(
+                        upload_id=upload.id,
+                        original_context=context,
+                        original_response=response_text,
+                        is_success=is_success,
+                        # Correctly populate extracted_outcome
+                        extracted_outcome={"value_from_file": raw_outcome}
+                    )
+                )
             
-            await db.commit()
-            
-            if upload.status == "COMPLETED":
-                print(f"Triggering pattern extraction for upload ID: {upload_id}")
-                extract_patterns_from_history_task.delay(upload_id)
+            db.add_all(interactions_to_create)
 
-    # We must import StringIO for this task
-    from io import StringIO
-    return asyncio.run(_run())
+            upload.status = "COMPLETED"
+            upload.total_interactions = len(df)
+            upload.processed_interactions = len(df)
+            upload.processing_completed_timestamp = datetime.now(timezone.utc)
+            db.commit()
 
+            print(f"Successfully parsed {len(df)} interactions. Triggering pattern extraction.")
+            extract_patterns_from_history_task.delay(upload_id)
+
+        except Exception as e:
+            print(f"FATAL Error processing file for upload {upload.id}: {e}")
+            upload.status = "FAILED"
+            db.commit()
 
 @celery_app.task
 def discover_patterns_from_live_data_task(agent_id: str):
@@ -180,6 +236,7 @@ def discover_patterns_from_live_data_task(agent_id: str):
             )
             db.add(new_pattern)
         
+        db.commit()
         print(f"Live pattern discovery complete for agent ID: {agent_id}")
 
 
@@ -203,6 +260,7 @@ def process_live_outcome_task(interaction_id: str):
                 if interaction.outcome.is_success:
                     pattern.success_count += 1
                 print(f"Updated stats for pattern {pattern.id}")
+        db.commit()
 
 
 @celery_app.task
@@ -226,5 +284,5 @@ def generate_opportunities_task(organization_id: str):
         #     source="LATENT_NEED"
         # )
         # db.add(new_opportunity)
-        
+        db.commit()
         print(f"Opportunity discovery complete for organization ID: {organization_id}")
