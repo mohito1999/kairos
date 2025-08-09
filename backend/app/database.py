@@ -1,5 +1,6 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
+from contextlib import contextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.core.config import settings
 
@@ -36,10 +37,16 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
 
-def get_sync_db():
-    """Helper function to get a sync database session for Celery tasks."""
+# CRITICAL FIX: This is the definitive context manager for sync sessions.
+@contextmanager
+def get_sync_db_session() -> Session:
+    """Provides a transactional scope around a series of operations for Celery."""
     db = SyncSessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

@@ -16,3 +16,4 @@ from .historical_interaction import HistoricalInteraction
 from .interaction import Interaction
 from .outcome import Outcome
 from .suggested_opportunity import SuggestedOpportunity
+from .human_interaction import HumanInteraction

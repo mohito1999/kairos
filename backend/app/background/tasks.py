@@ -5,26 +5,29 @@ from io import StringIO
 from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from typing import Dict, Any, Optional
 
 from app.core.celery_app import celery_app
-from contextlib import contextmanager
-from app.database import get_sync_db
-
-get_sync_db_session = contextmanager(get_sync_db)
+# Correctly import our definitive session manager
+from app.database import get_sync_db_session
 
 # Import all models
+from app.models.agent import Agent
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
+from app.models.human_interaction import HumanInteraction
 from app.models.learned_pattern import LearnedPattern
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.suggested_opportunity import SuggestedOpportunity
 
-# Import services (note: these will need sync versions or careful handling)
+# Import services
 from app.services import embedding_service, llm_service
+# CRITICAL FIX: Import the singleton instance, not the class
+from app.services.transcription_service import transcription_service
 import numpy as np
 from sklearn.cluster import DBSCAN
-import asyncio # We need asyncio only to run the async services
+import asyncio
 
 # --- SYNCHRONOUS CELERY TASKS ---
 
@@ -286,3 +289,81 @@ def generate_opportunities_task(organization_id: str):
         # db.add(new_opportunity)
         db.commit()
         print(f"Opportunity discovery complete for organization ID: {organization_id}")
+
+
+@celery_app.task
+def process_human_interaction_task(
+    agent_id: str,
+    recording_url: str,
+    context: Optional[Dict[str, Any]],
+    explicit_outcome: Optional[Dict[str, Any]],
+    outcome_goal: Optional[str]
+):
+    """
+    Processes a recorded human interaction: transcribes, determines outcome, and saves it.
+    Uses a sync DB session but calls async AI services.
+    """
+    
+    # This async sub-function will handle the AI calls
+    async def get_transcript_and_assessment():
+        print(f"Transcribing audio for agent {agent_id} from {recording_url}")
+        transcript = await transcription_service.transcribe_audio_from_url(recording_url)
+        
+        if "Error transcribing" in transcript:
+            return transcript, None # Return error and no assessment
+
+        # If we need to judge the outcome, do it here
+        is_success = None
+        if explicit_outcome:
+            is_success = bool(explicit_outcome.get("success", False))
+        elif outcome_goal:
+            system_prompt = """
+            You are a meticulous and objective AI evaluator. Your task is to determine if a conversation successfully met a specific goal.
+            Analyze the provided transcript and the success goal, then respond with a JSON object containing your assessment.
+            The JSON object MUST have the following keys and data types:
+            - "is_success": boolean (True if the goal was met, False otherwise).
+            - "confidence_score": float (Your confidence in the assessment, from 0.0 to 1.0).
+            - "reason": string (A brief, one-sentence explanation for your decision, from an objective third-person perspective).
+            - "failure_type": string or null (If not successful, choose ONE from this list: [UNRESOLVED_ISSUE, USER_FRUSTRATION, AGENT_CONFUSION, GOAL_NOT_MET]. Otherwise, null).
+            Only return a valid JSON object.
+            """
+            user_prompt = f"SUCCESS GOAL: \"{outcome_goal}\"\n\nCONVERSATION TRANSCRIPT:\n---\n{transcript}\n---"
+            
+            print("Performing AI-assisted outcome assessment...")
+            assessment = await llm_service.get_json_response(
+                system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o"
+            )
+            is_success = assessment.get("is_success", False)
+        
+        return transcript, is_success
+
+    # Run the async part to get the data we need
+    transcript, is_success = asyncio.run(get_transcript_and_assessment())
+
+    # Now, back in the sync world, interact with the database
+    if "Error transcribing" in transcript:
+        print(f"Failed to transcribe audio. Aborting database operations.")
+        return
+
+    with get_sync_db_session() as db:
+        try:
+            agent = db.get(Agent, uuid.UUID(agent_id))
+            if not agent:
+                print(f"Agent {agent_id} not found in database. Cannot save interaction.")
+                return
+
+            # Create the record in our new human_interactions table
+            new_interaction_record = HumanInteraction(
+                agent_id=uuid.UUID(agent_id),
+                organization_id=agent.organization_id,
+                recording_url=recording_url,
+                context=context,
+                transcript=transcript,
+                is_success=is_success,
+                status="PROCESSED"
+            )
+            db.add(new_interaction_record)
+            db.commit()
+            print(f"Human interaction {new_interaction_record.id} saved and processed successfully.")
+        except Exception as e:
+            print(f"Database error while saving human interaction: {e}")

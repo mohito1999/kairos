@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     
     # JWT
     JWT_SECRET_KEY: str
+
+    DEEPGRAM_API_KEY: str
     
     @property
     def DATABASE_URL(self) -> str:
