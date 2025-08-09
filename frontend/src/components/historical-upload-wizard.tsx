@@ -37,6 +37,7 @@ export default function HistoricalUploadWizard({ agentId }: HistoricalUploadWiza
   const [outcomeColumn, setOutcomeColumn] = useState<string>('')
   const [outcomeGoal, setOutcomeGoal] = useState<string>('')
   const [transcriptColumn, setTranscriptColumn] = useState<string>('')
+  const [primaryGroupingKey, setPrimaryGroupingKey] = useState<string>('');
   const [contextMappings, setContextMappings] = useState<ContextMapping[]>([
     { id: `ctx-${useId()}`, kairosKey: 'customer_type', fileColumn: '' }
   ]);
@@ -77,6 +78,7 @@ export default function HistoricalUploadWizard({ agentId }: HistoricalUploadWiza
     // Build the final dataMapping object
     const dataMapping: { [key: string]: string } = {};
     if (transcriptColumn) dataMapping['conversation_transcript'] = transcriptColumn;
+    if (primaryGroupingKey) dataMapping['primary_grouping_key'] = primaryGroupingKey;
 
     if (outcomeMethod === 'column') {
       if (!outcomeColumn) { setError("Please select an outcome column."); return; }
@@ -129,6 +131,23 @@ export default function HistoricalUploadWizard({ agentId }: HistoricalUploadWiza
                     <Label>Conversation Transcript <span className="text-red-500">*</span></Label>
                     <Select onValueChange={setTranscriptColumn} required>
                       <SelectTrigger><SelectValue placeholder="Select transcript column" /></SelectTrigger>
+                      <SelectContent>{headers.map(h => <SelectItem key={h} value={h}>{h}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+
+              {/* --- NEW STEP: OPTIONAL GROUPING KEY --- */}
+              <div className='space-y-2'>
+                <Label className='text-lg font-semibold'>Step 2.5: Select a Primary Grouping Key (Optional)</Label>
+                <CardDescription>
+                  Select a column with distinct categories (like 'customer_type' or 'inquiry_topic'). This helps Kairos find the most obvious patterns quickly.
+                </CardDescription>
+                <div className="space-y-4 mt-2 p-4 border rounded-md">
+                  <div className="grid grid-cols-2 items-center gap-4">
+                    <Label>Primary Grouping Key</Label>
+                    <Select onValueChange={setPrimaryGroupingKey}>
+                      <SelectTrigger><SelectValue placeholder="Select a grouping column" /></SelectTrigger>
                       <SelectContent>{headers.map(h => <SelectItem key={h} value={h}>{h}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
