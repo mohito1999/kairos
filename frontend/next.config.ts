@@ -17,6 +17,14 @@ const nextConfig: NextConfig = {
       },
     ],
   },
+  
+  // --- THE CORRECT FIX ---
+  // Nesting the Server Actions configuration inside the `experimental` block
+  experimental: {
+    serverActions: {
+      bodySizeLimit: '10mb', // Increase the upload limit to 10 Megabytes
+    },
+  },
 };
 
 export default nextConfig;

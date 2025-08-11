@@ -21,23 +21,11 @@ if not OPENROUTER_API_KEY:
 # Your local path to the folder containing the JSON transcripts
 SOURCE_DIR = "/Users/mohitmotwani/Downloads/insurance_outbound"
 # Where the final CSV will be saved
-OUTPUT_CSV_PATH = "./processed_insurance_calls.csv" 
-FILES_TO_PROCESS = 150
+OUTPUT_CSV_PATH = "./processed_insurance_calls_500.csv" 
+FILES_TO_PROCESS = 500
 
 
 # --- LLM PROMPTS ---
-
-DIARIZATION_SYSTEM_PROMPT = """
-You are an expert transcript analyst. Your task is to take a raw, unformatted call transcript and reformat it with speaker labels.
-The first speaker is always 'Agent'. The second speaker is 'Customer'. Alternate between them.
-Combine consecutive sentences from the same speaker into a single block.
-Return ONLY the formatted transcript, with no extra commentary.
-Example:
-Input: "Hello? Hi, this is Jane. How are you? I'm fine, thanks for asking."
-Output:
-Agent: Hello? Hi, this is Jane. How are you?
-Customer: I'm fine, thanks for asking.
-"""
 
 SUCCESS_JUDGE_SYSTEM_PROMPT = """
 You are an AI assistant for Kairos, specializing in analyzing sales call transcripts for the US Medicare insurance industry.
@@ -56,11 +44,11 @@ A "failure" is defined as:
 - The customer refuses to provide critical information (like their Medicare number or SSN).
 - The agent fails to overcome objections.
 
-Analyze the transcript and respond with a single word: "success" or "failure".
+Analyze the raw, undiarized transcript and respond with a JSON object with a single key "outcome" and a single word value: "success" or "failure".
 """
 
 CONTEXT_EXTRACTION_SYSTEM_PROMPT = """
-You are an expert data extraction AI. Analyze the provided call transcript from a Medicare insurance outbound call.
+You are an expert data extraction AI. Analyze the raw, undiarized call transcript from a Medicare insurance outbound call.
 Extract the following entities into a valid JSON object with the specified keys and data types:
 - "initial_objection": boolean (True if the customer shows any skepticism or asks about costs early on, otherwise False).
 - "data_correction_needed": boolean (True if the agent had to correct the customer's address, name, or DOB, otherwise False).
@@ -106,29 +94,22 @@ async def process_file(file_path: Path):
         raw_transcript = data.get("text")
         if not raw_transcript: return None
 
-        # 1. Diarize
-        diarization_response = await get_llm_json_response(
-            DIARIZATION_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o-mini"
-        )
-        # Simple text extraction, assuming LLM returns a simple structure like {"transcript": "..."}
-        diarized_transcript = next(iter(diarization_response.values()), raw_transcript)
-
-        # 2. Judge Outcome
+        # STEP 1: Judge the outcome using the RAW transcript
         outcome_response = await get_llm_json_response(
-            SUCCESS_JUDGE_SYSTEM_PROMPT, diarized_transcript, "openai/gpt-4o"
+            SUCCESS_JUDGE_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o"
         )
         outcome = "failure"
         for val in outcome_response.values():
             if isinstance(val, str) and val.lower() in ["success", "failure"]:
                 outcome = val.lower(); break
 
-        # 3. Extract Context
+        # STEP 2: Extract Context using the RAW transcript
         context_json = await get_llm_json_response(
-            CONTEXT_EXTRACTION_SYSTEM_PROMPT, diarized_transcript, "openai/gpt-4o"
+            CONTEXT_EXTRACTION_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o"
         )
 
         return {
-            "transcript": diarized_transcript,
+            "transcript": raw_transcript, # Use the raw, undiarized transcript
             "call_outcome": outcome,
             "initial_objection": context_json.get("initial_objection", False),
             "data_correction_needed": context_json.get("data_correction_needed", False),
@@ -165,16 +146,16 @@ async def main():
 
 if __name__ == "__main__":
     # Ensure full prompts are inserted here
-    DIARIZATION_SYSTEM_PROMPT = """
-You are an expert transcript analyst. Your task is to take a raw, unformatted call transcript and reformat it with speaker labels.
-The first speaker is always 'Agent'. The second speaker is 'Customer'. Alternate between them.
-Combine consecutive sentences from the same speaker into a single block.
-Return ONLY the formatted transcript as a JSON object with a single key "diarized_transcript".
-Example:
-Input: "Hello? Hi, this is Jane. How are you? I'm fine, thanks for asking."
-Output:
-{"diarized_transcript": "Agent: Hello? Hi, this is Jane. How are you?\\nCustomer: I'm fine, thanks for asking."}
-"""
+#     DIARIZATION_SYSTEM_PROMPT = """
+# You are an expert transcript analyst. Your task is to take a raw, unformatted call transcript and reformat it with speaker labels.
+# The first speaker is always 'Agent'. The second speaker is 'Customer'. Alternate between them.
+# Combine consecutive sentences from the same speaker into a single block.
+# Return ONLY the formatted transcript as a JSON object with a single key "diarized_transcript".
+# Example:
+# Input: "Hello? Hi, this is Jane. How are you? I'm fine, thanks for asking."
+# Output:
+# {"diarized_transcript": "Agent: Hello? Hi, this is Jane. How are you?\\nCustomer: I'm fine, thanks for asking."}
+# """
 
     SUCCESS_JUDGE_SYSTEM_PROMPT = """
 You are an AI assistant for Kairos, specializing in analyzing sales call transcripts for the US Medicare insurance industry.

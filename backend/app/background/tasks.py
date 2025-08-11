@@ -1,9 +1,11 @@
 # backend/app/background/tasks.py
 import uuid
 import json
+import asyncio
 import pandas as pd
 from io import StringIO
 from datetime import datetime, timezone
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional
@@ -28,11 +30,15 @@ from app.services import embedding_service, llm_service
 from app.services.transcription_service import transcription_service
 
 # --- NEW IMPORTS FOR HYBRID ENGINE ---
+# Scientific Libraries
 import numpy as np
+import statsmodels.api as sm
+from scipy.stats import ttest_ind
 from sklearn.cluster import DBSCAN, KMeans
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import silhouette_score, pairwise_distances
 from sklearn.metrics.pairwise import cosine_similarity
-import asyncio
+from sklearn.model_selection import train_test_split
 
 
 # --- NEW HELPER FUNCTIONS FOR HYBRID ENGINE (A1) ---
@@ -210,6 +216,70 @@ def smart_contextual_subclustering(context_embeddings: np.ndarray, min_k=2, max_
     print("  Contextual Pass: No suitable sub-cluster division found.")
     return None
 
+async def perform_causal_validation(pattern: LearnedPattern, holdout_ids: list[uuid.UUID], db: sa.orm.Session):
+    """
+    Performs a simplified causal analysis using Propensity Score Matching.
+    Returns uplift and p-value.
+    """
+    # 1. Identify Treatment and Control groups in the holdout set
+    pattern_trigger_embedding = await embedding_service.get_embedding(pattern.trigger_context_summary)
+    if not pattern_trigger_embedding: return None
+
+    holdout_interactions = db.execute(select(HistoricalInteraction).where(HistoricalInteraction.id.in_(holdout_ids))).scalars().all()
+    
+    # We need to find interactions where the pattern's TRIGGER was met.
+    # To do this, we find contexts in the holdout set that are similar to the pattern's trigger.
+    holdout_contexts = [json.dumps(i.original_context, sort_keys=True) for i in holdout_interactions]
+    holdout_embeddings = await embedding_service.get_embeddings(holdout_contexts)
+
+    similarity_threshold = 0.70 # Similarity threshold to be considered "matching" the trigger
+    
+    relevant_interactions = []
+    for i, embedding in enumerate(holdout_embeddings):
+        if not embedding: continue
+        similarity = cosine_similarity([pattern_trigger_embedding], [embedding])[0][0]
+        if similarity > similarity_threshold:
+            relevant_interactions.append(holdout_interactions[i])
+
+    if len(relevant_interactions) < 10: 
+        print(f"  Validation failed: Only found {len(relevant_interactions)} interactions in holdout set matching the trigger.")
+        return None
+
+    # Now, within these relevant interactions, which ones also used a similar STRATEGY?
+    pattern_strategy_embedding = await embedding_service.get_embedding(pattern.suggested_strategy)
+    if not pattern_strategy_embedding: return None
+
+    treatment_group, control_group = [], []
+    relevant_responses = [i.original_response for i in relevant_interactions]
+    relevant_response_embeddings = await embedding_service.get_embeddings(relevant_responses)
+
+    for i, embedding in enumerate(relevant_response_embeddings):
+        if not embedding: continue
+        similarity = cosine_similarity([pattern_strategy_embedding], [embedding])[0][0]
+        if similarity > similarity_threshold:
+            treatment_group.append(relevant_interactions[i]) # Used the strategy
+        else:
+            control_group.append(relevant_interactions[i]) # Did NOT use the strategy
+
+    print(f"  Found {len(treatment_group)} in Treatment Group, {len(control_group)} in Control Group.")
+
+    if not treatment_group or not control_group:
+        print("  Validation failed: Could not form both treatment and control groups.")
+        return None
+        
+    # 2. Perform a T-test for a simple statistical comparison
+    treatment_outcomes = [1 if i.is_success else 0 for i in treatment_group]
+    control_outcomes = [1 if i.is_success else 0 for i in control_group]
+
+    if np.mean(treatment_outcomes) <= np.mean(control_outcomes):
+        return {"uplift": np.mean(treatment_outcomes) - np.mean(control_outcomes), "p_value": 1.0}
+        
+    t_stat, p_value = ttest_ind(treatment_outcomes, control_outcomes, equal_var=False)
+
+    return {
+        "uplift": np.mean(treatment_outcomes) - np.mean(control_outcomes),
+        "p_value": p_value
+    }
 
 
 # --- CELERY TASKS ---
@@ -230,17 +300,26 @@ def extract_patterns_from_history_task(upload_id: str):
     try:
         with get_sync_db_session() as db:
             upload = db.get(HistoricalUpload, uuid.UUID(upload_id))
-            if not upload: 
-                print(f"Upload {upload_id} not found.")
+            if not upload or not upload.interaction_id_split:
+                print(f"Upload {upload_id} not found or has no interaction split.")
                 return
 
+            # --- KEY CHANGE: Only use the training set for discovery ---
+            training_set_ids_str = upload.interaction_id_split.get("training_set", [])
+            if not training_set_ids_str:
+                print("No training set interactions found for this upload.")
+                upload.status = "COMPLETED"
+                db.commit()
+                return
+            
+            training_set_ids = [uuid.UUID(id_str) for id_str in training_set_ids_str]
+
             stmt = select(HistoricalInteraction).where(
-                HistoricalInteraction.upload_id == upload.id,
-                HistoricalInteraction.is_success == True
+                HistoricalInteraction.id.in_(training_set_ids)
             )
             successful_interactions = db.execute(stmt).scalars().all()
             
-            print(f"Found {len(successful_interactions)} successful interactions to analyze.")
+            print(f"Found {len(successful_interactions)} successful interactions in the TRAINING SET to analyze.")
             if len(successful_interactions) < 5:
                 print("Not enough successful interactions to find meaningful patterns.")
                 upload.status = "COMPLETED"
@@ -306,9 +385,10 @@ def extract_patterns_from_history_task(upload_id: str):
                                         group_patterns.append(LearnedPattern(
                                             agent_id=upload.agent_id, 
                                             source="HISTORICAL_GROUPED",
+                                            source_upload_id=upload.id,
                                             trigger_context_summary=pattern_json["trigger_context_summary"],
                                             suggested_strategy=pattern_json["suggested_strategy"], 
-                                            status="ACTIVE",
+                                            status="CANDIDATE",
                                             impressions=len(interactions_in_group), 
                                             success_count=len(interactions_in_group)
                                         ))
@@ -451,9 +531,10 @@ def extract_patterns_from_history_task(upload_id: str):
                                     discovered_patterns.append(LearnedPattern(
                                         agent_id=upload.agent_id, 
                                         source="HISTORICAL_DISCOVERED",
+                                        source_upload_id=upload.id,
                                         trigger_context_summary=pattern_json["trigger_context_summary"],
                                         suggested_strategy=pattern_json["suggested_strategy"], 
-                                        status="ACTIVE",
+                                        status="CANDIDATE",
                                         impressions=len(interactions_in_sub_cluster), 
                                         success_count=len(interactions_in_sub_cluster)
                                     ))
@@ -490,7 +571,7 @@ def extract_patterns_from_history_task(upload_id: str):
                                 source="HISTORICAL_FALLBACK",
                                 trigger_context_summary="A frequently used, generally successful response from historical data.",
                                 suggested_strategy=most_common_response,
-                                status="ACTIVE",
+                                status="CANDIDATE",
                                 impressions=all_responses.count(most_common_response),
                                 success_count=all_responses.count(most_common_response)
                             ))
@@ -499,17 +580,22 @@ def extract_patterns_from_history_task(upload_id: str):
                 final_patterns = loop.run_until_complete(perform_final_pass_analysis())
                 patterns_to_create.extend(final_patterns)
 
-            # --- FINAL STEP: Save all discovered patterns ---
+            # --- FINAL CHANGE: Chain the new validation task ---
             if patterns_to_create:
-                print(f"Saving a total of {len(patterns_to_create)} new, high-quality patterns to the database.")
+                print(f"Saving a total of {len(patterns_to_create)} new CANDIDATE patterns.")
                 db.add_all(patterns_to_create)
             else:
                 print("No new patterns were generated in this run.")
-            
-            # Mark the upload as fully completed now that the engine has run
-            upload.status = "COMPLETED"
-            upload.processing_completed_timestamp = datetime.now(timezone.utc)
+
+            # We don't mark as COMPLETED yet. We queue the validation task.
+            upload.status = "VALIDATING"
             db.commit()
+            
+            print(f"Pattern extraction complete. Triggering validation task.")
+            celery_app.send_task(
+                'app.background.tasks.validate_patterns_task',
+                args=[upload_id]
+            )
 
     except Exception as e:
         print(f"FATAL ERROR in pattern extraction task: {e}")
@@ -583,8 +669,6 @@ def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, da
                 df = pd.read_csv(StringIO(csv_content))
                 print(f"Pandas DataFrame created with {len(df)} rows. Columns: {list(df.columns)}")
 
-                interactions_to_create = []
-                
                 # --- PRE-PROCESS THE DATA MAPPING ---
                 outcome_col = data_mapping.get("outcome_column")
                 outcome_goal = data_mapping.get("outcome_goal_description")
@@ -598,6 +682,10 @@ def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, da
                 if transcript_col and transcript_col not in df.columns:
                     print(f"Warning: Transcript column '{transcript_col}' not found in CSV.")
                     transcript_col = None
+
+                # --- NEW LOGIC: Split successful interactions into training and holdout sets ---
+                all_interactions = []
+                successful_interaction_ids = []
 
                 # --- ITERATE AND PROCESS EACH ROW ---
                 for index, row in df.iterrows():
@@ -625,18 +713,40 @@ def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, da
                         is_success = loop.run_until_complete(_judge_outcome(response_text, outcome_goal))
                         raw_outcome = "judged_by_ai"
                     
-                    interactions_to_create.append(
-                        HistoricalInteraction(
-                            upload_id=upload.id,
-                            original_context=context,
-                            original_response=response_text,
-                            is_success=is_success,
-                            extracted_outcome={"value_from_file": raw_outcome}
-                        )
+                    interaction_obj = HistoricalInteraction(
+                        upload_id=upload.id,
+                        original_context=context,
+                        original_response=response_text,
+                        is_success=is_success,
+                        extracted_outcome={"value_from_file": raw_outcome}
                     )
+                    all_interactions.append(interaction_obj)
+                    if is_success:
+                        # We need the ID before it's committed, so we assign one
+                        interaction_obj.id = uuid.uuid4()
+                        successful_interaction_ids.append(interaction_obj.id)
                 
                 # Bulk insert all interactions for efficiency
-                db.add_all(interactions_to_create)
+                db.add_all(all_interactions)
+
+                # Now, perform the 70/30 split
+                training_ids, holdout_ids = [], []
+                if len(successful_interaction_ids) >= 5: # Only split if there's enough data
+                    training_ids, holdout_ids = train_test_split(
+                        successful_interaction_ids,
+                        test_size=0.3,
+                        random_state=42
+                    )
+                else: # Otherwise, everything is for training
+                    training_ids = successful_interaction_ids
+                
+                print(f"Split successful interactions: {len(training_ids)} for training, {len(holdout_ids)} for holdout validation.")
+
+                # Save the split to the database
+                upload.interaction_id_split = {
+                    "training_set": [str(uid) for uid in training_ids],
+                    "holdout_set": [str(uid) for uid in holdout_ids]
+                }
 
                 upload.status = "PARSED"
                 upload.total_interactions = len(df)
@@ -870,3 +980,83 @@ def process_human_interaction_task(
             print(f"Error during loop cleanup: {cleanup_error}")
         finally:
             asyncio.set_event_loop(None)
+
+@celery_app.task(name='app.background.tasks.validate_patterns_task')
+def validate_patterns_task(upload_id: str):
+    """
+    Validates CANDIDATE patterns against the holdout set using causal inference
+    to determine if they are statistically significant.
+    """
+    print(f"Starting validation for patterns from upload ID: {upload_id}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        with get_sync_db_session() as db:
+            upload = db.get(HistoricalUpload, uuid.UUID(upload_id))
+            if not upload or not upload.interaction_id_split: return
+
+            holdout_set_ids_str = upload.interaction_id_split.get("holdout_set", [])
+            if not holdout_set_ids_str:
+                print("No holdout set. Marking upload as complete."); upload.status = "COMPLETED"; db.commit(); return
+
+            holdout_set_ids = [uuid.UUID(id_str) for id_str in holdout_set_ids_str]
+            
+            # For now, we associate patterns with uploads by adding the upload_id to the source.
+            # A future improvement would be a dedicated column.
+            candidate_patterns = db.execute(select(LearnedPattern).where(
+                LearnedPattern.source_upload_id == uuid.UUID(upload_id),
+                LearnedPattern.status == 'CANDIDATE'
+            )).scalars().all()
+
+            if not candidate_patterns:
+                print("No candidate patterns found to validate."); upload.status = "COMPLETED"; db.commit(); return
+            
+            print(f"Found {len(candidate_patterns)} candidate patterns to validate against {len(holdout_set_ids)} holdout interactions.")
+            
+            # --- The Causal Validation Loop ---
+            for pattern in candidate_patterns:
+                print(f"\n--- Validating Pattern {pattern.id} ---")
+                
+                # This is a complex async operation, so we run it in our loop.
+                validation_results = loop.run_until_complete(
+                    perform_causal_validation(pattern, holdout_set_ids, db)
+                )
+
+                if validation_results:
+                    pattern.uplift_score = validation_results["uplift"]
+                    pattern.p_value = validation_results["p_value"]
+                    
+                    # Check for statistical significance (p-value < 0.05)
+                    if validation_results["p_value"] < 0.05 and validation_results["uplift"] > 0:
+                        pattern.status = "VALIDATED"
+                        print(f"  RESULT: Pattern VALIDATED. Uplift: {pattern.uplift_score:+.2%}, p-value: {pattern.p_value:.4f}")
+                    else:
+                        pattern.status = "REJECTED"
+                        print(f"  RESULT: Pattern REJECTED. Insufficient statistical evidence.")
+                else:
+                    pattern.status = "REJECTED"
+                    print("  RESULT: Pattern REJECTED. Could not perform validation (not enough data).")
+
+            upload.status = "COMPLETED"
+            db.commit()
+
+    except Exception as e:
+        print(f"FATAL ERROR during validation task: {e}")
+        traceback.print_exc()
+        # Rollback any partial changes
+        with get_sync_db_session() as db:
+            upload = db.get(HistoricalUpload, uuid.UUID(upload_id))
+            if upload:
+                upload.status = "VALIDATION_FAILED"
+                db.commit()
+    finally:
+        # Event loop cleanup
+        try:
+            pending = asyncio.all_tasks(loop); [task.cancel() for task in pending]
+            if pending: loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+        except Exception as cleanup_error:
+            print(f"Error during loop cleanup: {cleanup_error}")
+        finally:
+            asyncio.set_event_loop(None)
+
