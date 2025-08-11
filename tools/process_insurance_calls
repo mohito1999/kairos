@@ -1,0 +1,209 @@
+# tools/process_insurance_calls.py
+import os
+import json
+import asyncio
+import pandas as pd
+from dotenv import load_dotenv
+from pathlib import Path
+from tqdm.asyncio import tqdm
+import openai
+
+# --- CONFIGURATION ---
+# Load environment variables from the backend/.env file
+# Assumes the script is run from the root of the 'kairos' repository
+dotenv_path = Path(__file__).parent.parent / 'backend' / '.env'
+load_dotenv(dotenv_path=dotenv_path)
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY not found in backend/.env file.")
+
+# Your local path to the folder containing the JSON transcripts
+SOURCE_DIR = "/Users/mohitmotwani/Downloads/insurance_outbound"
+# Where the final CSV will be saved
+OUTPUT_CSV_PATH = "./processed_insurance_calls.csv" 
+FILES_TO_PROCESS = 150
+
+
+# --- LLM PROMPTS ---
+
+DIARIZATION_SYSTEM_PROMPT = """
+You are an expert transcript analyst. Your task is to take a raw, unformatted call transcript and reformat it with speaker labels.
+The first speaker is always 'Agent'. The second speaker is 'Customer'. Alternate between them.
+Combine consecutive sentences from the same speaker into a single block.
+Return ONLY the formatted transcript, with no extra commentary.
+Example:
+Input: "Hello? Hi, this is Jane. How are you? I'm fine, thanks for asking."
+Output:
+Agent: Hello? Hi, this is Jane. How are you?
+Customer: I'm fine, thanks for asking.
+"""
+
+SUCCESS_JUDGE_SYSTEM_PROMPT = """
+You are an AI assistant for Kairos, specializing in analyzing sales call transcripts for the US Medicare insurance industry.
+Your task is to determine if a call was a "success" or a "failure".
+The primary goal of the agent is to verify the customer's eligibility and successfully transfer them to a licensed specialist.
+
+A "success" is defined as:
+- The agent successfully gathers information from the customer.
+- The customer agrees to be transferred.
+- The transfer is initiated, even if the specialist hasn't picked up yet.
+- The customer may show some hesitation, but the agent successfully overcomes it.
+
+A "failure" is defined as:
+- The customer hangs up or ends the call prematurely.
+- The customer explicitly refuses to be transferred.
+- The customer refuses to provide critical information (like their Medicare number or SSN).
+- The agent fails to overcome objections.
+
+Analyze the transcript and respond with a single word: "success" or "failure".
+"""
+
+CONTEXT_EXTRACTION_SYSTEM_PROMPT = """
+You are an expert data extraction AI. Analyze the provided call transcript from a Medicare insurance outbound call.
+Extract the following entities into a valid JSON object with the specified keys and data types:
+- "initial_objection": boolean (True if the customer shows any skepticism or asks about costs early on, otherwise False).
+- "data_correction_needed": boolean (True if the agent had to correct the customer's address, name, or DOB, otherwise False).
+- "card_retrieval_hesitation": boolean (True if the customer expresses any hesitation, concern, or refusal about getting their Medicare card or providing the number, otherwise False).
+- "verified_own_decisions": boolean (True if the customer confirms they make their own decisions, False if they refuse or the agent doesn't ask).
+
+Only return the JSON object. Do not include any explanations.
+"""
+
+# --- API CLIENT SETUP ---
+client = openai.AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+# --- CORE LOGIC ---
+
+async def get_llm_json_response(system_prompt: str, user_prompt: str, model: str):
+    """A self-contained helper to get a JSON response from the LLM."""
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            extra_headers={ "HTTP-Referer": "http://localhost", "X-Title": "Kairos Tools" }
+        )
+        content = response.choices[0].message.content
+        return json.loads(content) if content else {}
+    except Exception as e:
+        print(f"  LLM call failed: {e}")
+        return {}
+
+
+async def process_file(file_path: Path):
+    """Processes a single JSON file for transcript, outcome, and context."""
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        raw_transcript = data.get("text")
+        if not raw_transcript: return None
+
+        # 1. Diarize
+        diarization_response = await get_llm_json_response(
+            DIARIZATION_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o-mini"
+        )
+        # Simple text extraction, assuming LLM returns a simple structure like {"transcript": "..."}
+        diarized_transcript = next(iter(diarization_response.values()), raw_transcript)
+
+        # 2. Judge Outcome
+        outcome_response = await get_llm_json_response(
+            SUCCESS_JUDGE_SYSTEM_PROMPT, diarized_transcript, "openai/gpt-4o"
+        )
+        outcome = "failure"
+        for val in outcome_response.values():
+            if isinstance(val, str) and val.lower() in ["success", "failure"]:
+                outcome = val.lower(); break
+
+        # 3. Extract Context
+        context_json = await get_llm_json_response(
+            CONTEXT_EXTRACTION_SYSTEM_PROMPT, diarized_transcript, "openai/gpt-4o"
+        )
+
+        return {
+            "transcript": diarized_transcript,
+            "call_outcome": outcome,
+            "initial_objection": context_json.get("initial_objection", False),
+            "data_correction_needed": context_json.get("data_correction_needed", False),
+            "card_retrieval_hesitation": context_json.get("card_retrieval_hesitation", False),
+            "verified_own_decisions": context_json.get("verified_own_decisions", True),
+            "source_file": file_path.name
+        }
+    except Exception as e:
+        print(f"  Error processing {file_path.name}: {e}")
+        return None
+
+async def main():
+    """Main function to find files, process them in parallel, and save to CSV."""
+    source_path = Path(SOURCE_DIR)
+    json_files = sorted(list(source_path.glob("*.json")))[:FILES_TO_PROCESS]
+
+    if not json_files:
+        print(f"No JSON files found in {SOURCE_DIR}"); return
+
+    print(f"Found {len(json_files)} files to process.")
+    
+    tasks = [process_file(fp) for fp in json_files]
+    results = await tqdm.gather(*tasks, desc="Processing Transcripts")
+    
+    successful_results = [res for res in results if res is not None]
+
+    if not successful_results:
+        print("No files were successfully processed."); return
+        
+    df = pd.DataFrame(successful_results)
+    df.to_csv(OUTPUT_CSV_PATH, index=False)
+    print(f"\n✅ Successfully processed {len(successful_results)} files.")
+    print(f"   Output saved to: {os.path.abspath(OUTPUT_CSV_PATH)}")
+
+if __name__ == "__main__":
+    # Ensure full prompts are inserted here
+    DIARIZATION_SYSTEM_PROMPT = """
+You are an expert transcript analyst. Your task is to take a raw, unformatted call transcript and reformat it with speaker labels.
+The first speaker is always 'Agent'. The second speaker is 'Customer'. Alternate between them.
+Combine consecutive sentences from the same speaker into a single block.
+Return ONLY the formatted transcript as a JSON object with a single key "diarized_transcript".
+Example:
+Input: "Hello? Hi, this is Jane. How are you? I'm fine, thanks for asking."
+Output:
+{"diarized_transcript": "Agent: Hello? Hi, this is Jane. How are you?\\nCustomer: I'm fine, thanks for asking."}
+"""
+
+    SUCCESS_JUDGE_SYSTEM_PROMPT = """
+You are an AI assistant for Kairos, specializing in analyzing sales call transcripts for the US Medicare insurance industry.
+Your task is to determine if a call was a "success" or a "failure".
+The primary goal of the agent is to verify the customer's eligibility and successfully transfer them to a licensed specialist.
+
+A "success" is defined as:
+- The agent successfully gathers information from the customer.
+- The customer agrees to be transferred.
+- The transfer is initiated, even if the specialist hasn't picked up yet.
+- The customer may show some hesitation, but the agent successfully overcomes it.
+
+A "failure" is defined as:
+- The customer hangs up or ends the call prematurely.
+- The customer explicitly refuses to be transferred.
+- The customer refuses to provide critical information (like their Medicare number or SSN).
+- The agent fails to overcome objections.
+
+Analyze the transcript and respond with a JSON object with a single key "outcome" and a single word value: "success" or "failure".
+"""
+
+    CONTEXT_EXTRACTION_SYSTEM_PROMPT = """
+You are an expert data extraction AI. Analyze the provided call transcript from a Medicare insurance outbound call.
+Extract the following entities into a valid JSON object with the specified keys and data types:
+- "initial_objection": boolean (True if the customer shows any skepticism or asks about costs early on, otherwise False).
+- "data_correction_needed": boolean (True if the agent had to correct the customer's address, name, or DOB, otherwise False).
+- "card_retrieval_hesitation": boolean (True if the customer expresses any hesitation, concern, or refusal about getting their Medicare card or providing the number, otherwise False).
+- "verified_own_decisions": boolean (True if the customer confirms they make their own decisions, False if they refuse or the agent doesn't ask).
+
+Only return the JSON object. Do not include any explanations.
+"""
+    asyncio.run(main())

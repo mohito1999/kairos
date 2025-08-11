@@ -29,7 +29,8 @@ from app.services.transcription_service import transcription_service
 
 # --- NEW IMPORTS FOR HYBRID ENGINE ---
 import numpy as np
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, KMeans
+from sklearn.metrics import silhouette_score, pairwise_distances
 from sklearn.metrics.pairwise import cosine_similarity
 import asyncio
 
@@ -161,14 +162,64 @@ def is_quality_pattern(pattern_json: dict) -> bool:
     return True
 
 
-# --- EXISTING (SOON TO BE REPLACED/UPDATED) CELERY TASKS ---
+def smart_contextual_subclustering(context_embeddings: np.ndarray, min_k=2, max_k=5, min_cluster_size=3):
+    """
+    Tries multiple clustering approaches (K-Means with optimal k) and picks the best result
+    based on silhouette score to force differentiation in contexts.
+    """
+    if len(context_embeddings) < (min_k * min_cluster_size):
+        print(f"  Contextual Pass: Not enough data ({len(context_embeddings)} items) for meaningful sub-clustering. Skipping.")
+        return None
+
+    # We will test K-Means for a range of k values
+    possible_k_values = range(min_k, min(max_k + 1, len(context_embeddings) // min_cluster_size))
+    
+    best_labels = None
+    best_score = -1.0  # Silhouette score ranges from -1 to 1
+    best_k = 0
+
+    print(f"  Contextual Pass: Testing k={list(possible_k_values)} for K-Means.")
+    for k in possible_k_values:
+        if k <= 1: continue
+
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+        try:
+            cluster_labels = kmeans.fit_predict(context_embeddings)
+        except Exception as e:
+            print(f"    K-Means failed for k={k}: {e}")
+            continue
+
+        # Guardrail: ensure no cluster is smaller than our minimum size
+        unique_labels, counts = np.unique(cluster_labels, return_counts=True)
+        if np.min(counts) < min_cluster_size:
+            print(f"    k={k} resulted in a cluster smaller than {min_cluster_size}. Discarding.")
+            continue
+            
+        score = silhouette_score(context_embeddings, cluster_labels, metric='cosine')
+        print(f"    k={k}, silhouette score: {score:.3f}")
+
+        if score > best_score:
+            best_score = score
+            best_labels = cluster_labels
+            best_k = k
+    
+    if best_labels is not None:
+        print(f"  Contextual Pass: Selected optimal k={best_k} with silhouette score: {best_score:.3f}")
+        return best_labels
+    
+    print("  Contextual Pass: No suitable sub-cluster division found.")
+    return None
+
+
+
+# --- CELERY TASKS ---
 
 @celery_app.task(name='app.background.tasks.extract_patterns_from_history_task')
 def extract_patterns_from_history_task(upload_id: str):
     """
-    Analyzes historical data using the definitive Hybrid Intelligence Engine.
-    This task implements our two-stage discovery process to find both high-confidence
-    and emergent behavioral patterns, while filtering for quality and uniqueness.
+    Analyzes historical data using the definitive, context-aware Hybrid Intelligence Engine.
+    This task implements our final multi-stage discovery process to find specific,
+    nuanced, and high-quality behavioral patterns.
     """
     print(f"Starting DEFINITIVE HYBRID pattern extraction for upload ID: {upload_id}")
     
@@ -279,110 +330,152 @@ def extract_patterns_from_history_task(upload_id: str):
                 patterns_to_create.extend(group_patterns)
                 print(f"Stage 1 generated {len(group_patterns)} high-confidence patterns from grouped data.")
             else:
-                print("Stage 1: No suitable grouping key found. Proceeding directly to Stage 2.")
+                print("Stage 1: No suitable grouping key found. Will proceed to Stage 2 clustering.")
 
-            # --- STAGE 2: The "Deep Search" (Behavioral Clustering) ---
+            # --- STAGE 2: Context-Aware Deep Search with Smart Sub-Clustering ---
             ungrouped_interactions = [inter for inter in successful_interactions if inter.id not in processed_interaction_ids]
             print(f"Stage 1 complete. {len(ungrouped_interactions)} interactions remain for deep search.")
 
             if len(ungrouped_interactions) >= 5:
-                print(f"Stage 2: Starting Deep Search on {len(ungrouped_interactions)} interactions.")
+                print(f"Stage 2: Starting Context-Aware Deep Search on {len(ungrouped_interactions)} interactions.")
                 
-                async def perform_behavioral_analysis():
+                async def perform_context_aware_deep_search():
                     try:
+                        # --- Pass 1: Cluster by BEHAVIOR ---
                         responses_to_embed = [inter.original_response for inter in ungrouped_interactions if inter.original_response]
                         if not responses_to_embed: return []
 
-                        embeddings = await embedding_service.get_embeddings(responses_to_embed)
+                        behavior_embeddings = await embedding_service.get_embeddings(responses_to_embed)
+                        valid_behavior_embeddings = [emb for emb in behavior_embeddings if emb]
+                        valid_behavior_interactions = [inter for i, inter in enumerate(ungrouped_interactions) if behavior_embeddings and i < len(behavior_embeddings) and behavior_embeddings[i]]
                         
-                        valid_embeddings = [emb for emb in embeddings if emb]
-                        valid_interactions = [inter for i, inter in enumerate(ungrouped_interactions) if embeddings and i < len(embeddings) and embeddings[i]]
-                        
-                        if len(valid_embeddings) < 3:
-                            print("Stage 2: Not enough valid response embeddings for clustering.")
+                        if len(valid_behavior_embeddings) < 3:
+                            print("Stage 2: Not enough valid response embeddings for behavioral clustering.")
                             return []
                         
-                        params = get_clustering_params(len(valid_embeddings))
-                        print(f"Stage 2: Using adaptive clustering parameters for {len(valid_embeddings)} items: {params}")
-
-                        clustering = DBSCAN(eps=params["eps"], min_samples=params["min_samples"], metric="cosine").fit(np.array(valid_embeddings))
-                        labels = clustering.labels_
+                        behavior_params = get_clustering_params(len(valid_behavior_embeddings))
+                        print(f"  Behavioral Pass: Clustering {len(valid_behavior_embeddings)} items with params {behavior_params}")
+                        behavior_clustering = DBSCAN(eps=behavior_params["eps"], min_samples=behavior_params["min_samples"], metric="cosine").fit(np.array(valid_behavior_embeddings))
                         
-                        clusters = {label: [] for label in set(labels) if label != -1}
-                        for i, label in enumerate(labels):
-                            if label != -1:
-                                clusters[label].append(valid_interactions[i])
+                        behavior_clusters = {label: [] for label in set(behavior_clustering.labels_) if label != -1}
+                        for i, label in enumerate(behavior_clustering.labels_):
+                            if label != -1: 
+                                behavior_clusters[label].append(valid_behavior_interactions[i])
 
-                        print(f"Stage 2: Deep Search found {len(clusters)} potential behavioral pattern clusters.")
+                        print(f"  Behavioral Pass: Found {len(behavior_clusters)} broad behavioral families.")
                         
                         discovered_patterns = []
-                        for label, interactions_in_cluster in clusters.items():
-                            print(f"--- Analyzing Cluster #{label} with {len(interactions_in_cluster)} interactions ---")
-                            sample_contexts = [inter.original_context for inter in interactions_in_cluster[:10]]
-                            sample_response = interactions_in_cluster[0].original_response
 
-                            system_prompt = """
-                            You are an expert data strategist. Your task is to find a specific, tactical pattern from the provided data.
-                            A group of conversations has been clustered based on a similar successful AGENT BEHAVIOR. 
-                            Analyze the diverse contexts to find the underlying, abstract trigger that justifies this agent behavior.
-                            IMPORTANT: Do NOT provide generic advice like "be helpful" or "listen to the customer". Focus on concrete, repeatable actions.
-                            Respond in a valid JSON format with "trigger_context_summary" and "suggested_strategy".
-                            """
-                            user_prompt = f"""
-                            The successful agent strategy was a variant of this: "{sample_response}"
-
-                            This strategy worked in these diverse situations (contexts):
-                            ---
-                            {json.dumps(sample_contexts, indent=2)}
-                            ---
-                            Based on the contexts, what is the specific, non-obvious trigger for this strategy?
-                            What is a concise, tactical instruction for the agent's strategy?
-                            """
+                        # --- Pass 2: Sub-Cluster by CONTEXT using Smart Contextual Sub-Clustering ---
+                        for label, interactions_in_cluster in behavior_clusters.items():
+                            print(f"\n--- Analyzing Behavioral Family #{label} with {len(interactions_in_cluster)} interactions ---")
                             
-                            pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o")
-
-                            if not pattern_json or "suggested_strategy" not in pattern_json:
-                                print(f"Cluster #{label}: LLM failed to return valid JSON. Skipping.")
-                                continue
-
-                            print(f"Cluster #{label}: LLM generated strategy: '{pattern_json['suggested_strategy']}'")
-                            
-                            # Quality gate check
-                            if not is_quality_pattern(pattern_json):
-                                print(f"Cluster #{label}: Pattern failed quality gate. Skipping.")
-                                continue
-
-                            # Duplicate check
-                            if await is_duplicate_pattern(pattern_json["suggested_strategy"], upload.agent_id):
-                                print(f"Cluster #{label}: Pattern failed de-duplication gate. Skipping.")
+                            # Skip if cluster is too small for meaningful sub-clustering
+                            if len(interactions_in_cluster) < 4:  # Min needed for K-Means
+                                print(f"Behavioral Family #{label} is too small for sub-clustering ({len(interactions_in_cluster)} < 4). Skipping.")
                                 continue
                             
-                            print(f"Cluster #{label}: PASSED ALL GATES. Creating new pattern.")
-                            discovered_patterns.append(LearnedPattern(
-                                agent_id=upload.agent_id, 
-                                source="HISTORICAL_DISCOVERED",
-                                trigger_context_summary=pattern_json["trigger_context_summary"],
-                                suggested_strategy=pattern_json["suggested_strategy"], 
-                                status="ACTIVE",
-                                impressions=len(interactions_in_cluster), 
-                                success_count=len(interactions_in_cluster)
-                            ))
+                            contexts_to_embed = [json.dumps(inter.original_context, sort_keys=True) for inter in interactions_in_cluster if inter.original_context]
+                            if len(contexts_to_embed) < 4:
+                                print(f"Behavioral Family #{label}: Not enough valid contexts for sub-clustering.")
+                                continue
+
+                            context_embeddings = await embedding_service.get_embeddings(contexts_to_embed)
+                            valid_context_embeddings = [emb for emb in context_embeddings if emb]
+                            valid_context_interactions = [inter for i, inter in enumerate(interactions_in_cluster) if context_embeddings and i < len(context_embeddings) and context_embeddings[i]]
+
+                            if len(valid_context_embeddings) < 4:
+                                print(f"Behavioral Family #{label}: Not enough valid context embeddings for sub-clustering.")
+                                continue
+                            
+                            # --- THE NEW CORE LOGIC: Smart Contextual Sub-Clustering ---
+                            print(f"  Contextual Pass: Using smart sub-clustering on {len(valid_context_embeddings)} contexts")
+                            context_labels = smart_contextual_subclustering(np.array(valid_context_embeddings))
+
+                            if context_labels is not None:
+                                sub_clusters = {sub_label: [] for sub_label in set(context_labels)}
+                                for i, sub_label in enumerate(context_labels):
+                                    sub_clusters[sub_label].append(valid_context_interactions[i])
+                                
+                                print(f"  Contextual Pass: Differentiated into {len(sub_clusters)} specific sub-patterns.")
+
+                                for sub_label, interactions_in_sub_cluster in sub_clusters.items():
+                                    # --- GUARDRAIL: Minimum Viable Cluster Size ---
+                                    MINIMUM_CLUSTER_SIZE = 3
+                                    if len(interactions_in_sub_cluster) < MINIMUM_CLUSTER_SIZE:
+                                        print(f"    Sub-cluster #{sub_label} is too small ({len(interactions_in_sub_cluster)} interactions). Discarding.")
+                                        continue
+
+                                    print(f"    --- Synthesizing Pattern from Sub-Cluster #{sub_label} ({len(interactions_in_sub_cluster)} interactions) ---")
+                                    sample_contexts = [inter.original_context for inter in interactions_in_sub_cluster[:10]]
+                                    sample_response = interactions_in_sub_cluster[0].original_response
+                                    
+                                    # Using the refined, more demanding prompt
+                                    system_prompt = """
+                                    You are an expert data strategist. Your task is to find a specific, tactical pattern from the provided data.
+                                    A group of conversations has been clustered based on a similar successful AGENT BEHAVIOR. 
+                                    Analyze the diverse contexts to find the underlying, abstract trigger that justifies this agent behavior.
+                                    IMPORTANT: Do NOT provide generic advice like "be helpful" or "listen to the customer". Focus on concrete, repeatable actions.
+                                    Respond in a valid JSON format with "trigger_context_summary" and "suggested_strategy".
+                                    """
+                                    user_prompt = f"""
+                                    The successful agent strategy was a variant of this: "{sample_response}"
+
+                                    This strategy worked in these diverse situations (contexts):
+                                    ---
+                                    {json.dumps(sample_contexts, indent=2)}
+                                    ---
+                                    Based on the contexts, what is the specific, non-obvious trigger for this strategy?
+                                    What is a concise, tactical instruction for the agent's strategy?
+                                    """
+                                    
+                                    pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o")
+
+                                    if not pattern_json or "suggested_strategy" not in pattern_json:
+                                        print(f"    Sub-cluster #{sub_label}: LLM failed to return valid JSON. Skipping.")
+                                        continue
+
+                                    print(f"    Sub-cluster #{sub_label}: LLM generated strategy: '{pattern_json['suggested_strategy']}'")
+                                    
+                                    # Quality gate check
+                                    if not is_quality_pattern(pattern_json):
+                                        print(f"    Sub-cluster #{sub_label}: Pattern failed quality gate. Skipping.")
+                                        continue
+
+                                    # Duplicate check
+                                    if await is_duplicate_pattern(pattern_json["suggested_strategy"], upload.agent_id):
+                                        print(f"    Sub-cluster #{sub_label}: Pattern failed de-duplication gate. Skipping.")
+                                        continue
+                                    
+                                    print(f"    Sub-cluster #{sub_label}: PASSED ALL GATES. Creating new pattern.")
+                                    discovered_patterns.append(LearnedPattern(
+                                        agent_id=upload.agent_id, 
+                                        source="HISTORICAL_DISCOVERED",
+                                        trigger_context_summary=pattern_json["trigger_context_summary"],
+                                        suggested_strategy=pattern_json["suggested_strategy"], 
+                                        status="ACTIVE",
+                                        impressions=len(interactions_in_sub_cluster), 
+                                        success_count=len(interactions_in_sub_cluster)
+                                    ))
+                            else:
+                                print(f"  Contextual Pass: Could not find a meaningful way to differentiate contexts for Behavioral Family #{label}. No patterns generated for this behavioral family.")
+                        
                         return discovered_patterns
                     
                     except Exception as e:
-                        print(f"FATAL ERROR during clustering analysis: {e}")
+                        print(f"FATAL ERROR during context-aware deep search: {e}")
                         import traceback
                         traceback.print_exc()
                         return []
 
                 # Run the async analysis for Stage 2 using the persistent loop
-                clustered_patterns = loop.run_until_complete(perform_behavioral_analysis())
+                clustered_patterns = loop.run_until_complete(perform_context_aware_deep_search())
                 patterns_to_create.extend(clustered_patterns)
-                print(f"Stage 2 generated {len(clustered_patterns)} emergent patterns from clustering.")
+                print(f"Stage 2 generated {len(clustered_patterns)} emergent patterns from context-aware clustering.")
             else:
                 print("Not enough remaining interactions for deep search clustering.")
 
-            # --- FALLBACK STRATEGY ---
+            # --- STAGE 3: FALLBACK STRATEGY ---
             if not patterns_to_create and len(successful_interactions) >= 5:
                 print("Stage 3: No specific patterns found in main pipeline. Running Final Pass as a fallback.")
                 async def perform_final_pass_analysis():

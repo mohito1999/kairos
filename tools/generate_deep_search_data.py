@@ -1,3 +1,4 @@
+# tools/generate_deep_search_data.py
 import os
 import openai
 import pandas as pd
