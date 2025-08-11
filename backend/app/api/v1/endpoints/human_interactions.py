@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, HttpUrl
 from typing import Dict, Any, Optional
 
 from app.models.agent import Agent
 from app.core.dependencies import get_agent_from_sdk_auth
-from app.background.tasks import process_human_interaction_task
+from app.core.celery_app import celery_app
 
 router = APIRouter()
 
@@ -23,11 +23,14 @@ async def human_interaction_webhook(
     Accepts a webhook with a recording URL from a human interaction
     and queues it for transcription and analysis.
     """
-    process_human_interaction_task.delay(
-        agent_id=str(agent.id),
-        recording_url=str(payload.recording_url),
-        context=payload.context,
-        explicit_outcome=payload.outcome,
-        outcome_goal=payload.outcome_goal_description
+    celery_app.send_task(
+        'app.background.tasks.process_human_interaction_task',
+        args=[
+            str(agent.id),
+            str(payload.recording_url),
+            payload.context,
+            payload.outcome,
+            payload.outcome_goal_description
+        ]
     )
     return {"status": "accepted", "message": "Human interaction queued for processing."}

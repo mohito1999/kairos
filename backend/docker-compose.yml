@@ -1,3 +1,5 @@
+# backend/docker-compose.yml
+
 services:
   api:
     build: .
@@ -21,7 +23,7 @@ services:
       - redis_data:/data
     restart: unless-stopped
 
-  # --- NEW, CRITICAL SERVICE ---
+  # --- UPDATED WORKER SERVICE ---
   worker:
     build: .
     container_name: kairos_worker
@@ -31,8 +33,24 @@ services:
       - .env
     depends_on:
       - redis
-    # This command starts the Celery worker.
-    command: celery -A app.core.celery_app.celery_app worker --loglevel=info
+    # The command now points to the app instance inside our new worker.py entry point.
+    command: celery -A app.worker.celery_app worker --loglevel=info
+
+  # --- NEW FLOWER MONITORING SERVICE (Optional but recommended) ---
+  flower:
+    build: .
+    container_name: kairos_flower
+    ports:
+      - "5555:5555"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - worker
+    # Flower also points to our new worker entry point to find the app.
+    command: celery -A app.worker.celery_app flower --port=5555
 
 volumes:
   redis_data:

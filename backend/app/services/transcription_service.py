@@ -9,7 +9,7 @@ class TranscriptionService:
 
     async def transcribe_audio_from_url(self, audio_url: str) -> str:
         """
-        Transcribes audio from a public URL using Deepgram Nova-2 with diarization.
+        Transcribes audio from a public URL using Deepgram Nova-3 with diarization.
         Returns a formatted transcript string.
         """
         try:

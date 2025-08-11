@@ -21,7 +21,7 @@ from app.models.agent import Agent
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.learned_pattern import LearnedPattern
-from app.background.tasks import process_live_outcome_task
+from app.core.celery_app import celery_app
 
 router = APIRouter()
 
@@ -204,6 +204,9 @@ async def record_interaction_outcome(
     await db.commit()
 
     # Trigger the background learning task
-    process_live_outcome_task.delay(str(request.interaction_id))
+    celery_app.send_task(
+        'app.background.tasks.process_live_outcome_task',
+        args=[str(request.interaction_id)]
+    )
 
     return InteractionOutcomeResponse()

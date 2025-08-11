@@ -32,6 +32,7 @@ pandas = "^2.3.1"
 python-multipart = "^0.0.20"
 numpy = "^2.3.2"
 deepgram-sdk = "^4.8.1"
+flower = "^2.0.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"
