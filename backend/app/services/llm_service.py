@@ -1,18 +1,15 @@
-from openai import AsyncOpenAI
-from app.core.config import settings
+# backend/app/services/llm_service.py (Revised)
 import json
+from app.core.async_context import get_async_context
 
-# We use the OpenAI client, but point it to the OpenRouter base URL
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=settings.OPENROUTER_API_KEY,
-)
-
-async def get_json_response(system_prompt: str, user_prompt: str, model: str = "mistralai/mistral-7b-instruct:free"):
+async def get_json_response(system_prompt: str, user_prompt: str, model: str = "openai/gpt-4o-mini"):
     """
     Gets a structured JSON response from an LLM via OpenRouter.
-    Uses a fast, free model by default for tasks like context extraction.
+    Fetches the client from the async context to ensure it's process-safe.
     """
+    async_context = get_async_context()
+    client = async_context.openrouter_client # Use the new property
+
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -21,10 +18,10 @@ async def get_json_response(system_prompt: str, user_prompt: str, model: str = "
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
+            extra_headers={ "HTTP-Referer": "http://localhost", "X-Title": "Kairos Engine" }
         )
         content = response.choices[0].message.content
         return json.loads(content) if content else {}
     except Exception as e:
         print(f"Error getting JSON response from LLM: {e}")
-        # In a real app, we'd have more robust error handling and logging here
         return {}

@@ -1,17 +1,16 @@
 # backend/app/core/celery_app.py
-
 from celery import Celery
+import os
 
-# Note: We've removed the os.getenv for now to keep it simple and rely on the docker-compose default.
-# The app name is also changed as suggested.
 celery_app = Celery(
     "kairos_tasks",
     broker="redis://redis:6379/0",
     backend="redis://redis:6379/0",
 )
 
-# Configure Celery settings using his recommendations for a production-ready setup
+# PRODUCTION-READY CELERY CONFIGURATION
 celery_app.conf.update(
+    # Basic settings
     imports=(
         'app.background.tasks',
     ),
@@ -21,7 +20,30 @@ celery_app.conf.update(
     result_serializer='json',
     timezone='UTC',
     enable_utc=True,
+    
+    # CRITICAL: Process-safe worker configuration
+    # Use 'solo' pool for development/debugging or 'threads' for production
+    # This avoids the fork-related async issues entirely
+    worker_pool='threads',  # Alternative: 'solo' for single-threaded debugging
+    worker_concurrency=4,   # Adjust based on your server capacity
+    
+    # Reliability settings
+    task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_acks_late=True, # Good for reliability
-    result_expires=3600, # Results expire after 1 hour
+    result_expires=3600,
+    task_soft_time_limit=1800,  # 30 minutes
+    task_time_limit=2400,       # 40 minutes (hard limit)
+    
+    # Connection settings
+    broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    
+    # Memory management
+    worker_max_tasks_per_child=50,  # Restart workers after 50 tasks to prevent memory leaks
+    worker_disable_rate_limits=True,
+    
+    # Async-friendly settings
+    worker_lost_wait=10.0,
+    worker_send_task_events=True,
+    task_send_sent_event=True,
 )

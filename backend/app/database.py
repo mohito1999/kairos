@@ -1,26 +1,21 @@
-# backend/app/database.py
+# backend/app/database.py 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 
-# --- ASYNC ENGINE & SESSION FOR FASTAPI ---
-async_engine = create_async_engine(
-    settings.DATABASE_URL, # Uses postgresql+asyncpg://
-    pool_pre_ping=True,
-)
+# --- ASYNC ENGINE & SESSION - DEPRECATED ---
+# We are REMOVING the module-level async engine and session factory.
+# These will now be managed by the async_context to prevent process-forking issues.
+#
+# async_engine = create_async_engine(...)
+# AsyncSessionLocal = async_sessionmaker(...)
 
-AsyncSessionLocal = async_sessionmaker(
-    autocommit=False, 
-    autoflush=False, 
-    bind=async_engine,
-    class_=AsyncSession,
-    expire_on_commit=False # Good practice for async sessions
-)
 
-# --- SYNC ENGINE & SESSION FOR CELERY ---
-# Note: settings.SYNC_DATABASE_URL converts the URL to use psycopg2
+# --- SYNC ENGINE & SESSION FOR CELERY (UNCHANGED) ---
+# This part remains exactly the same. It is used by our synchronous tasks
+# and is perfectly safe.
 sync_engine = create_engine(
     settings.SYNC_DATABASE_URL, # Uses postgresql+psycopg2://
     pool_pre_ping=True,
@@ -33,15 +28,26 @@ SyncSessionLocal = sessionmaker(
 )
 
 # --- DEPENDENCIES ---
-async def get_db():
-    """FastAPI dependency to get an async database session."""
-    async with AsyncSessionLocal() as session:
+
+# Import the new context manager for the FastAPI dependency
+from app.core.async_context import get_async_context
+
+async def get_db() -> AsyncSession:
+    """
+    FastAPI dependency to get an async database session from our new context.
+    """
+    async_context = get_async_context()
+    session_factory = async_context.session_factory
+    
+    async with session_factory() as session:
         yield session
 
-# CRITICAL FIX: This is the definitive context manager for sync sessions.
 @contextmanager
 def get_sync_db_session() -> Session:
-    """Provides a transactional scope around a series of operations for Celery."""
+    """
+    Provides a transactional scope around a series of operations for Celery.
+    (UNCHANGED)
+    """
     db = SyncSessionLocal()
     try:
         yield db
