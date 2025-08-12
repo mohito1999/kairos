@@ -299,7 +299,7 @@ def extract_patterns_from_history_task(upload_id: str):
                                 """
                                 user_prompt = f"Context Key: '{best_grouping_key}' is '{context_key}'.\nSuccessful agent responses:\n---\n{json.dumps(sample_responses, indent=2)}\n---"
                                 
-                                pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o")
+                                pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o-mini")
 
                                 if pattern_json and "suggested_strategy" in pattern_json and is_quality_pattern(pattern_json):
                                     if not await is_duplicate_pattern(pattern_json["suggested_strategy"], upload.agent_id):
@@ -429,7 +429,7 @@ def extract_patterns_from_history_task(upload_id: str):
                                     What is a concise, tactical instruction for the agent's strategy?
                                     """
                                     
-                                    pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o")
+                                    pattern_json = await llm_service.get_json_response(system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o-mini")
 
                                     if not pattern_json or "suggested_strategy" not in pattern_json:
                                         print(f"    Sub-cluster #{sub_label}: LLM failed to return valid JSON. Skipping.")
@@ -563,7 +563,7 @@ def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, da
             
             try:
                 assessment = await llm_service.get_json_response(
-                    system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o"
+                    system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o-mini"
                 )
                 return assessment.get("is_success", False)
             except Exception as e:
@@ -813,7 +813,7 @@ def process_human_interaction_task(
                 print("Performing AI-assisted outcome assessment...")
                 try:
                     assessment = await llm_service.get_json_response(
-                        system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o"
+                        system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o-mini"
                     )
                     is_success = assessment.get("is_success", False)
                 except Exception as e:
