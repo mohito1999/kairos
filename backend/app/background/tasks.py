@@ -1,5 +1,5 @@
 # backend/app/background/tasks.py
-import uuid, json, asyncio, traceback, concurrent.futures
+import uuid, json, asyncio, traceback
 import pandas as pd
 from io import StringIO
 from datetime import datetime, timezone
@@ -7,8 +7,8 @@ from typing import Dict, Any, Optional, List
 
 # SQLAlchemy and DB
 import sqlalchemy as sa
-from sqlalchemy import select, text
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_sync_db_session
 from app.core.async_context import get_async_context, close_async_context
@@ -180,8 +180,24 @@ async def is_duplicate_pattern_async(session: AsyncSession, new_pattern_strategy
             return True
     return False
 
+def calculate_medoid_and_threshold(embeddings: np.ndarray):
+    """Calculates the medoid vector and an adaptive similarity threshold for a cluster."""
+    if len(embeddings) == 0:
+        return None, None
+    
+    centroid = np.mean(embeddings, axis=0)
+    similarities_to_centroid = cosine_similarity(embeddings, [centroid])
+    medoid_index = np.argmax(similarities_to_centroid)
+    medoid_embedding = embeddings[medoid_index]
+    
+    similarities_to_medoid = cosine_similarity(embeddings, [medoid_embedding]).flatten()
+    adaptive_threshold = np.percentile(similarities_to_medoid, 10) # 10th percentile
+    
+    return medoid_embedding.tolist(), float(adaptive_threshold)
+
+
 async def perform_consensus_check_and_analysis_async(session: AsyncSession, context_groups: dict, upload_agent_id: uuid.UUID, best_grouping_key: str) -> list:
-    """Performs consensus analysis for pre-grouped data."""
+    """Performs consensus analysis for pre-grouped data, returning full pattern data."""
     group_patterns = []
     
     for context_key, interactions_in_group in context_groups.items():
@@ -191,7 +207,7 @@ async def perform_consensus_check_and_analysis_async(session: AsyncSession, cont
         if not all_responses: continue
             
         all_embeddings = await embedding_service.get_embeddings(all_responses)
-        valid_embeddings = [emb for emb in all_embeddings if emb]
+        valid_embeddings = np.array([emb for emb in all_embeddings if emb])
         if len(valid_embeddings) < 2: continue
         
         similarity_matrix = cosine_similarity(valid_embeddings)
@@ -215,16 +231,34 @@ async def perform_consensus_check_and_analysis_async(session: AsyncSession, cont
                 is_quality_pattern(pattern_json) and
                 not await is_duplicate_pattern_async(session, pattern_json["suggested_strategy"], upload_agent_id)):
                 
+                # --- THE FIX: Calculate medoid and threshold for Stage 1 patterns ---
+                contexts_to_embed = [json.dumps(inter.original_context, sort_keys=True) for inter in interactions_in_group if inter.original_context]
+                context_embeddings = np.array([emb for emb in await embedding_service.get_embeddings(contexts_to_embed) if emb])
+
+                if len(context_embeddings) > 0:
+                    centroid = np.mean(context_embeddings, axis=0)
+                    similarities_to_centroid = cosine_similarity(context_embeddings, [centroid])
+                    medoid_index = np.argmax(similarities_to_centroid)
+                    medoid_embedding = context_embeddings[medoid_index]
+                    
+                    similarities_to_medoid = cosine_similarity(context_embeddings, [medoid_embedding]).flatten()
+                    adaptive_threshold = np.percentile(similarities_to_medoid, 10)
+                else:
+                    medoid_embedding, adaptive_threshold = None, None
+
                 group_patterns.append({
                     'trigger_context_summary': pattern_json["trigger_context_summary"],
                     'suggested_strategy': pattern_json["suggested_strategy"],
                     'impressions': len(interactions_in_group),
-                    'success_count': len(interactions_in_group)
+                    'success_count': len(interactions_in_group),
+                    'trigger_embedding': medoid_embedding.tolist() if medoid_embedding is not None else None,
+                    'trigger_threshold': adaptive_threshold
                 })
         else:
             print(f"Group '{context_key}': Similarity outside optimal range (0.75, 0.95].")
     
     return group_patterns
+
         
 async def perform_context_aware_deep_search_async(session: AsyncSession, ungrouped_interactions: list, upload_agent_id: uuid.UUID) -> list:
     """Performs deep contextual search on ungrouped data."""
@@ -287,64 +321,103 @@ async def perform_context_aware_deep_search_async(session: AsyncSession, ungroup
                 if not pattern_json or "suggested_strategy" not in pattern_json: continue
 
                 if (is_quality_pattern(pattern_json) and not await is_duplicate_pattern_async(session, pattern_json["suggested_strategy"], upload_agent_id)):
-                    print(f"Sub-cluster #{sub_label}: PASSED ALL GATES. Creating pattern.")
+                    print(f"    Sub-cluster #{sub_label}: PASSED ALL GATES. Creating pattern.")
                     
+                    # --- THE FIX: Define the indices before using them ---
                     sub_cluster_indices = [i for i, l in enumerate(context_labels) if l == sub_label]
-                    sub_cluster_embeddings = valid_context_embeddings[sub_cluster_indices]
-                    centroid_embedding = np.mean(sub_cluster_embeddings, axis=0).tolist() if len(sub_cluster_embeddings) > 0 else None
+                    sub_cluster_context_embeddings = valid_context_embeddings[sub_cluster_indices]
+                    
+                    trigger_embedding, trigger_threshold = calculate_medoid_and_threshold(sub_cluster_context_embeddings)
 
+                    # 2. Calculate for Behavior (Strategy)
+                    sub_cluster_response_texts = [valid_context_interactions[i].original_response for i in sub_cluster_indices]
+                    sub_cluster_response_embeddings = np.array(await embedding_service.get_embeddings(sub_cluster_response_texts))
+                    strategy_embedding, strategy_threshold = calculate_medoid_and_threshold(sub_cluster_response_embeddings)
+                    
                     discovered_patterns.append({
                         'trigger_context_summary': pattern_json["trigger_context_summary"],
-                        'trigger_embedding': centroid_embedding,
                         'suggested_strategy': pattern_json["suggested_strategy"],
+                        'trigger_embedding': trigger_embedding,
+                        'trigger_threshold': trigger_threshold,
+                        'strategy_embedding': strategy_embedding,
+                        'strategy_threshold': strategy_threshold,
                         'impressions': len(interactions_in_sub_cluster),
                         'success_count': len(interactions_in_sub_cluster)
                     })
     return discovered_patterns
 
 async def perform_causal_validation_async(session: AsyncSession, pattern: LearnedPattern, holdout_ids: List[uuid.UUID]) -> dict | None:
-    """Performs causal analysis using a holdout set."""
-    pattern_trigger_embedding = pattern.trigger_embedding 
-    if pattern_trigger_embedding is None: 
-        print(f"  Validation failed: Pattern {pattern.id} is missing a trigger embedding.")
+    """
+    Performs causal analysis using the pattern's stored, data-driven embeddings and adaptive thresholds.
+    """
+    # --- 1. Load Data-Driven Trigger and Strategy Representations ---
+    trigger_embedding = pattern.trigger_embedding
+    trigger_threshold = pattern.trigger_threshold
+    strategy_embedding = pattern.strategy_embedding
+    strategy_threshold = pattern.strategy_threshold
+
+    # --- Guardrail: Ensure the pattern has all necessary data for validation ---
+    if (trigger_embedding is None or len(trigger_embedding) == 0 or
+        trigger_threshold is None or
+        strategy_embedding is None or len(strategy_embedding) == 0 or
+        strategy_threshold is None):
+        print(f"  Validation failed: Pattern {pattern.id} is missing a required embedding or threshold.")
         return None
 
-    holdout_interactions = (await session.execute(select(HistoricalInteraction).where(HistoricalInteraction.id.in_(holdout_ids)))).scalars().all()
+    # --- 2. Find Relevant Interactions in the Holdout Set (Context Matching) ---
+    holdout_interactions = (await session.execute(
+        select(HistoricalInteraction).where(HistoricalInteraction.id.in_(holdout_ids))
+    )).scalars().all()
     
     holdout_contexts = [json.dumps(i.original_context, sort_keys=True) for i in holdout_interactions]
-    holdout_embeddings = await embedding_service.get_embeddings(holdout_contexts)
+    holdout_context_embeddings = await embedding_service.get_embeddings(holdout_contexts)
 
     relevant_interactions = []
-    for i, embedding in enumerate(holdout_embeddings):
-        if not embedding: continue
-        similarity = cosine_similarity([pattern_trigger_embedding], [embedding])[0][0]
-        if similarity > 0.70: relevant_interactions.append(holdout_interactions[i])
+    for i, ctx_embedding in enumerate(holdout_context_embeddings):
+        if ctx_embedding:
+            similarity = cosine_similarity([trigger_embedding], [ctx_embedding])[0][0]
+            if similarity > trigger_threshold:
+                relevant_interactions.append(holdout_interactions[i])
 
-    if len(relevant_interactions) < 10: return None
+    print(f"  Found {len(relevant_interactions)} relevant interactions for validation (trigger_threshold: {trigger_threshold:.3f})")
+    if len(relevant_interactions) < 10:
+        return None
 
-    pattern_strategy_embedding = await embedding_service.get_embedding(pattern.suggested_strategy)
-    if not pattern_strategy_embedding: return None
-
+    # --- 3. Form Treatment vs. Control Groups (Strategy Matching) ---
     treatment_group, control_group = [], []
     relevant_responses = [i.original_response for i in relevant_interactions]
     relevant_response_embeddings = await embedding_service.get_embeddings(relevant_responses)
 
-    for i, embedding in enumerate(relevant_response_embeddings):
-        if not embedding: continue
-        similarity = cosine_similarity([pattern_strategy_embedding], [embedding])[0][0]
-        if similarity > 0.70: treatment_group.append(relevant_interactions[i])
-        else: control_group.append(relevant_interactions[i])
+    for i, resp_embedding in enumerate(relevant_response_embeddings):
+        if resp_embedding:
+            similarity = cosine_similarity([strategy_embedding], [resp_embedding])[0][0]
+            if similarity > strategy_threshold:
+                treatment_group.append(relevant_interactions[i])  # Used the strategy
+            else:
+                control_group.append(relevant_interactions[i])  # Did NOT use the strategy
 
-    if not treatment_group or not control_group: return None
+    print(f"  Treatment: {len(treatment_group)}, Control: {len(control_group)} (strategy_threshold: {strategy_threshold:.3f})")
+    if not treatment_group or not control_group:
+        print("  Validation failed: Could not form both treatment and control groups.")
+        return None
         
+    # --- 4. Perform Statistical Test (T-test) ---
     treatment_outcomes = [1 if i.is_success else 0 for i in treatment_group]
     control_outcomes = [1 if i.is_success else 0 for i in control_group]
 
-    if np.mean(treatment_outcomes) <= np.mean(control_outcomes):
-        return {"uplift": np.mean(treatment_outcomes) - np.mean(control_outcomes), "p_value": 1.0}
-        
+    # Handle cases where one group has no variance (all same outcome)
+    if len(set(treatment_outcomes)) < 2 or len(set(control_outcomes)) < 2:
+        # If no variance, a t-test is not meaningful. Compare means directly.
+        uplift = np.mean(treatment_outcomes) - np.mean(control_outcomes)
+        # Assign a high p-value as the result is not statistically robust
+        return {"uplift": uplift, "p_value": 0.5} 
+
+    # Proceed with t-test if there's variance in both groups
     t_stat, p_value = ttest_ind(treatment_outcomes, control_outcomes, equal_var=False)
-    return {"uplift": np.mean(treatment_outcomes) - np.mean(control_outcomes), "p_value": p_value}
+    uplift = np.mean(treatment_outcomes) - np.mean(control_outcomes)
+
+    return {"uplift": uplift, "p_value": p_value}
+
 
 async def judge_outcome_async(transcript: str, goal: str) -> bool:
     """AI-powered outcome judgment."""
@@ -452,7 +525,12 @@ async def extract_patterns_from_history_async(upload_id: str):
         if len(ungrouped) >= 5:
             clustered_patterns = await perform_context_aware_deep_search_async(session, ungrouped, upload.agent_id)
             for p_data in clustered_patterns:
-                patterns_to_create.append(LearnedPattern(agent_id=upload.agent_id, source="HISTORICAL_DISCOVERED", source_upload_id=upload.id, status=PatternStatus.CANDIDATE, **p_data))
+                patterns_to_create.append(LearnedPattern(
+                    agent_id=upload.agent_id, 
+                    source="HISTORICAL_DISCOVERED",
+                    source_upload_id=upload.id, 
+                    status=PatternStatus.CANDIDATE, 
+                    **p_data))
 
         if patterns_to_create:
             session.add_all(patterns_to_create)

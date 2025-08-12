@@ -19,7 +19,13 @@ class LearnedPattern(Base):
     
     trigger_context_summary = Column(Text, nullable=True)
     trigger_embedding = Column(Vector(1536), nullable=True)
+
+    trigger_threshold = Column(Float, nullable=True)
+
     suggested_strategy = Column(Text, nullable=False)
+    strategy_embedding = Column(Vector(1536), nullable=True) # Data-driven medoid of responses
+    strategy_threshold = Column(Float, nullable=True) # Data-driven adaptive threshold
+
     
     impressions = Column(Integer, nullable=False, default=0)
     success_count = Column(Integer, nullable=False, default=0)
