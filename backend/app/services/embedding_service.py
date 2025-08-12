@@ -19,7 +19,7 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
 
     # OpenAI's API has a limit on the number of texts per request (e.g., 2048)
     # and total tokens. We'll use a conservative batch size to stay safe.
-    BATCH_SIZE = 100 
+    BATCH_SIZE = 50 
     all_embeddings = []
     
     for i in range(0, len(texts), BATCH_SIZE):

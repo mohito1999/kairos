@@ -96,7 +96,7 @@ async def process_file(file_path: Path):
 
         # STEP 1: Judge the outcome using the RAW transcript
         outcome_response = await get_llm_json_response(
-            SUCCESS_JUDGE_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o"
+            SUCCESS_JUDGE_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o-mini"
         )
         outcome = "failure"
         for val in outcome_response.values():
@@ -105,7 +105,7 @@ async def process_file(file_path: Path):
 
         # STEP 2: Extract Context using the RAW transcript
         context_json = await get_llm_json_response(
-            CONTEXT_EXTRACTION_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o"
+            CONTEXT_EXTRACTION_SYSTEM_PROMPT, raw_transcript, "openai/gpt-4o-mini"
         )
 
         return {
