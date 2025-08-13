@@ -14,14 +14,14 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 
 from app.core.config import settings
 from app.core.celery_app import celery_app
-from app.database import get_sync_db_session # We still need the sync session for sync tasks
+from app.database import get_sync_db_session
 
 # Models
 from app.models.agent import Agent
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
 from app.models.human_interaction import HumanInteraction
-from app.models.learned_pattern import LearnedPattern
+from app.models.learned_pattern import LearnedPattern # Remove PatternStatus import
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.suggested_opportunity import SuggestedOpportunity
@@ -38,7 +38,6 @@ from scipy.stats import ttest_ind
 
 # --- ROBUST ASYNC TASK RUNNER ---
 def run_async_task(async_func, *args, **kwargs):
-    """A robust wrapper to create a new event loop for each Celery task."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -54,16 +53,18 @@ def run_async_task(async_func, *args, **kwargs):
 
 # --- ASYNC HELPER FUNCTIONS ---
 async def is_duplicate_pattern(session: AsyncSession, new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
+    # FIX: Compare status to a simple string
     stmt = select(LearnedPattern).where(
         LearnedPattern.agent_id == agent_id, 
-        sa.cast(LearnedPattern.status, sa.String) == "ACTIVE"
+        LearnedPattern.status == "ACTIVE"
     )
     existing_patterns = (await session.execute(stmt)).scalars().all()
     if not existing_patterns: return False
     
-    new_embedding = (await embedding_service.get_embeddings([new_pattern_strategy]))[0]
-    if not new_embedding: return False
+    new_embedding_list = await embedding_service.get_embeddings([new_pattern_strategy])
+    if not new_embedding_list or not new_embedding_list[0]: return False
     
+    new_embedding = new_embedding_list[0]
     existing_embeddings = await embedding_service.get_embeddings([p.suggested_strategy for p in existing_patterns])
     for emb in existing_embeddings:
         if emb and cosine_similarity([new_embedding], [emb])[0][0] > 0.95:
@@ -76,7 +77,7 @@ def is_quality_pattern(pattern_json: dict) -> bool:
     if len(strategy.split()) < 4 or len(trigger.split()) < 3: return False
     return True
 
-# --- ASYNC ORCHESTRATORS WITH ISOLATED SESSIONS ---
+# --- ASYNC ORCHESTRATORS ---
 
 async def _async_process_historical_upload(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     engine = create_async_engine(settings.DATABASE_URL)
@@ -93,7 +94,6 @@ async def _async_process_historical_upload(upload_id: str, file_content_bytes: b
             if not transcript_col or transcript_col not in df.columns:
                 raise ValueError(f"Transcript column '{transcript_col}' not found.")
             
-            # ... (rest of the function logic is the same)
             outcome_col = data_mapping.get("outcome_column")
             outcome_goal = data_mapping.get("outcome_goal_description")
             context_cols = {k: v for k, v in data_mapping.items() if k.startswith("context_")}
@@ -102,7 +102,6 @@ async def _async_process_historical_upload(upload_id: str, file_content_bytes: b
             for _, row in df.iterrows():
                 context = {k.replace("context_", ""): row.get(v) for k, v in context_cols.items() if v in df.columns}
                 response_text = str(row.get(transcript_col, ""))
-                
                 is_success, raw_outcome = False, ""
                 if outcome_col and outcome_col in df.columns:
                     raw_outcome_val = str(row.get(outcome_col, ""))
@@ -159,7 +158,6 @@ async def _async_extract_patterns_from_history(upload_id: str):
     engine = create_async_engine(settings.DATABASE_URL)
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
-        # ... (rest of the function logic is the same)
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
         if not upload or not upload.interaction_id_split: return
 
@@ -206,7 +204,7 @@ async def _async_extract_patterns_from_history(upload_id: str):
             positive_snippets = [i.original_response for i in winning_interactions[:5]]
             negative_snippets = [i.original_response for i in losing_interactions[:5]]
             
-            system_prompt = "You are a sales coach. Analyze failed vs successful conversation snippets from the same situation. Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
+            system_prompt = "You are a sales coach. Analyze failed vs successful conversation snippets... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
             user_prompt = f"FAILED SNIPPETS:\n{json.dumps(negative_snippets)}\n\nSUCCESSFUL SNIPPETS:\n{json.dumps(positive_snippets)}\n\nWhat is the battleground and the specific, winning strategy?"
             
             pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
@@ -232,7 +230,6 @@ async def _async_validate_patterns(upload_id: str):
     engine = create_async_engine(settings.DATABASE_URL)
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
-        # ... (rest of the function logic is the same)
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
         if not upload or not upload.interaction_id_split: return
 
@@ -258,7 +255,9 @@ async def _async_validate_patterns(upload_id: str):
             uplift = np.mean(treatment_outcomes) - np.mean(control_outcomes)
 
             if p_value < 0.1 and uplift > 0:
-                pattern.status, pattern.uplift_score, pattern.p_value = "VALIDATED", uplift, p_value
+                pattern.status = "VALIDATED"
+                pattern.uplift_score = uplift
+                pattern.p_value = p_value
             else:
                 pattern.status = "REJECTED"
         
@@ -270,7 +269,6 @@ async def _async_process_human_interaction(agent_id: str, recording_url: str, co
     engine = create_async_engine(settings.DATABASE_URL)
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
-        # ... (rest of the function logic is the same)
         transcript = await transcription_service.transcribe_audio_from_url(recording_url)
         if "Error transcribing" in transcript: return
 
@@ -313,7 +311,6 @@ def validate_patterns_task(upload_id: str):
 def process_human_interaction_task(agent_id: str, recording_url: str, context: Optional[Dict[str, Any]], explicit_outcome: Optional[Dict[str, Any]], outcome_goal: Optional[str]):
     run_async_task(_async_process_human_interaction, agent_id, recording_url, context, explicit_outcome, outcome_goal)
 
-# --- (Other sync-compatible tasks remain the same) ---
 @celery_app.task(name='app.background.tasks.process_live_outcome_task')
 def process_live_outcome_task(interaction_id: str):
     with get_sync_db_session() as db:
