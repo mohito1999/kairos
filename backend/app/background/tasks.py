@@ -39,7 +39,7 @@ from scipy.stats import ttest_ind
 
 async def is_duplicate_pattern(new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
     async with AsyncSessionLocal() as db:
-        stmt = select(LearnedPattern).where(LearnedPattern.agent_id == agent_id, LearnedPattern.status == "ACTIVE")
+        stmt = select(LearnedPattern).where(LearnedPattern.agent_id == agent_id, sa.cast(LearnedPattern.status, sa.String) == "ACTIVE")
         result = await db.execute(stmt)
         existing_patterns = result.scalars().all()
         if not existing_patterns: return False
@@ -194,8 +194,10 @@ async def _async_extract_patterns_from_history(upload_id: str):
             if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(pattern_json["suggested_strategy"], upload.agent_id):
                 patterns_to_create.append(LearnedPattern(
                     agent_id=upload.agent_id, source="HISTORICAL_CONTRASTIVE", status="CANDIDATE", source_upload_id=upload.id,
-                    battleground_context={"cluster_id": cluster_id}, positive_examples={"transcripts": positive_snippets},
-                    negative_examples={"transcripts": negative_snippets}, trigger_context_summary=pattern_json["trigger_context_summary"],
+                    battleground_context={"cluster_id": int(cluster_id)},
+                    positive_examples={"transcripts": positive_snippets},
+                    negative_examples={"transcripts": negative_snippets}, 
+                    trigger_context_summary=pattern_json["trigger_context_summary"],
                     suggested_strategy=pattern_json["suggested_strategy"],
                 ))
         
