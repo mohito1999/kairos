@@ -10,9 +10,11 @@ import asyncio
 import sqlalchemy as sa
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
+from app.core.config import settings
 from app.core.celery_app import celery_app
-from app.database import get_sync_db_session, AsyncSessionLocal
+from app.database import get_sync_db_session # We still need the sync session for sync tasks
 
 # Models
 from app.models.agent import Agent
@@ -36,46 +38,37 @@ from scipy.stats import ttest_ind
 
 # --- ROBUST ASYNC TASK RUNNER ---
 def run_async_task(async_func, *args, **kwargs):
-    """
-    A robust wrapper to create a new event loop for each Celery task,
-    run the async function, and properly clean up the loop.
-    """
+    """A robust wrapper to create a new event loop for each Celery task."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        # loop.run_until_complete() is the correct way to run the top-level async function
         return loop.run_until_complete(async_func(*args, **kwargs))
     finally:
-        # Ensure all tasks are cancelled before closing
         tasks = asyncio.all_tasks(loop=loop)
         for task in tasks:
             task.cancel()
-        
-        # Gather all cancelled tasks to let them finish cancelling
         if tasks:
             loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-            
         loop.close()
         asyncio.set_event_loop(None)
 
 # --- ASYNC HELPER FUNCTIONS ---
-async def is_duplicate_pattern(new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
-    async with AsyncSessionLocal() as db:
-        stmt = select(LearnedPattern).where(
-            LearnedPattern.agent_id == agent_id, 
-            sa.cast(LearnedPattern.status, sa.String) == "ACTIVE"
-        )
-        existing_patterns = (await db.execute(stmt)).scalars().all()
-        if not existing_patterns: return False
-        
-        new_embedding = (await embedding_service.get_embeddings([new_pattern_strategy]))[0]
-        if not new_embedding: return False
-        
-        existing_embeddings = await embedding_service.get_embeddings([p.suggested_strategy for p in existing_patterns])
-        for emb in existing_embeddings:
-            if emb and cosine_similarity([new_embedding], [emb])[0][0] > 0.95:
-                return True
-        return False
+async def is_duplicate_pattern(session: AsyncSession, new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
+    stmt = select(LearnedPattern).where(
+        LearnedPattern.agent_id == agent_id, 
+        sa.cast(LearnedPattern.status, sa.String) == "ACTIVE"
+    )
+    existing_patterns = (await session.execute(stmt)).scalars().all()
+    if not existing_patterns: return False
+    
+    new_embedding = (await embedding_service.get_embeddings([new_pattern_strategy]))[0]
+    if not new_embedding: return False
+    
+    existing_embeddings = await embedding_service.get_embeddings([p.suggested_strategy for p in existing_patterns])
+    for emb in existing_embeddings:
+        if emb and cosine_similarity([new_embedding], [emb])[0][0] > 0.95:
+            return True
+    return False
 
 def is_quality_pattern(pattern_json: dict) -> bool:
     strategy = pattern_json.get("suggested_strategy", "").lower()
@@ -83,26 +76,27 @@ def is_quality_pattern(pattern_json: dict) -> bool:
     if len(strategy.split()) < 4 or len(trigger.split()) < 3: return False
     return True
 
-# --- ASYNC ORCHESTRATORS ---
+# --- ASYNC ORCHESTRATORS WITH ISOLATED SESSIONS ---
 
 async def _async_process_historical_upload(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
-    """Parses a CSV file and saves interactions to the database."""
-    # ... (This function's internal logic is correct and remains unchanged)
-    async with AsyncSessionLocal() as db:
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
-        if not upload: print(f"Upload {upload_id} not found."); return
+        if not upload: return
 
         try:
             csv_content = file_content_bytes.decode('utf-8', errors='ignore')
             df = pd.read_csv(StringIO(csv_content))
             
+            transcript_col = data_mapping.get("conversation_transcript")
+            if not transcript_col or transcript_col not in df.columns:
+                raise ValueError(f"Transcript column '{transcript_col}' not found.")
+            
+            # ... (rest of the function logic is the same)
             outcome_col = data_mapping.get("outcome_column")
             outcome_goal = data_mapping.get("outcome_goal_description")
-            transcript_col = data_mapping.get("conversation_transcript")
             context_cols = {k: v for k, v in data_mapping.items() if k.startswith("context_")}
-
-            if not transcript_col or transcript_col not in df.columns:
-                raise ValueError(f"Transcript column '{transcript_col}' not found in CSV.")
 
             interactions_to_create = []
             for _, row in df.iterrows():
@@ -132,16 +126,16 @@ async def _async_process_historical_upload(upload_id: str, file_content_bytes: b
             upload.processed_interactions = len(df)
             await db.commit()
             
-            print(f"Successfully parsed {len(df)} interactions. Triggering data split.")
             celery_app.send_task('app.background.tasks.split_historical_data_task', args=[upload_id])
         except Exception as e:
             print(f"Error processing upload {upload.id}: {e}")
             upload.status = "FAILED"; await db.commit()
+    await engine.dispose()
 
 async def _async_split_historical_data(upload_id: str):
-    """Splits interactions into training and holdout sets."""
-    # ... (This function's internal logic is correct and remains unchanged)
-    async with AsyncSessionLocal() as db:
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
         if not upload: return
 
@@ -158,13 +152,14 @@ async def _async_split_historical_data(upload_id: str):
         upload.status = "EXTRACTING_PATTERNS"
         await db.commit()
         
-        print(f"Split data into {len(training_ids)} training and {len(holdout_ids)} holdout. Triggering pattern extraction.")
         celery_app.send_task('app.background.tasks.extract_patterns_from_history_task', args=[upload_id])
+    await engine.dispose()
 
 async def _async_extract_patterns_from_history(upload_id: str):
-    """The async core of the pattern extraction task."""
-    # ... (This function's internal logic is correct and remains unchanged)
-    async with AsyncSessionLocal() as db:
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
+        # ... (rest of the function logic is the same)
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
         if not upload or not upload.interaction_id_split: return
 
@@ -216,7 +211,7 @@ async def _async_extract_patterns_from_history(upload_id: str):
             
             pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
 
-            if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(pattern_json["suggested_strategy"], upload.agent_id):
+            if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(db, pattern_json["suggested_strategy"], upload.agent_id):
                 patterns_to_create.append(LearnedPattern(
                     agent_id=upload.agent_id, source="HISTORICAL_CONTRASTIVE", status="CANDIDATE", source_upload_id=upload.id,
                     battleground_context={"cluster_id": int(cluster_id)}, positive_examples={"transcripts": positive_snippets},
@@ -231,11 +226,13 @@ async def _async_extract_patterns_from_history(upload_id: str):
             celery_app.send_task('app.background.tasks.validate_patterns_task', args=[upload_id])
         else:
             upload.status = "COMPLETED"; await db.commit()
+    await engine.dispose()
 
 async def _async_validate_patterns(upload_id: str):
-    """The async core of the pattern validation task."""
-    # ... (This function's internal logic is correct and remains unchanged)
-    async with AsyncSessionLocal() as db:
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
+        # ... (rest of the function logic is the same)
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
         if not upload or not upload.interaction_id_split: return
 
@@ -267,10 +264,13 @@ async def _async_validate_patterns(upload_id: str):
         
         upload.status = "COMPLETED"
         await db.commit()
+    await engine.dispose()
 
 async def _async_process_human_interaction(agent_id: str, recording_url: str, context: Optional[Dict[str, Any]], explicit_outcome: Optional[Dict[str, Any]], outcome_goal: Optional[str]):
-    # ... (This function's internal logic is correct and remains unchanged)
-    async with AsyncSessionLocal() as db:
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
+        # ... (rest of the function logic is the same)
         transcript = await transcription_service.transcribe_audio_from_url(recording_url)
         if "Error transcribing" in transcript: return
 
@@ -289,8 +289,9 @@ async def _async_process_human_interaction(agent_id: str, recording_url: str, co
             context=context, transcript=transcript, is_success=is_success, status="PROCESSED"
         ))
         await db.commit()
+    await engine.dispose()
 
-# --- CELERY TASK DEFINITIONS (NOW USING THE ROBUST WRAPPER) ---
+# --- CELERY TASK DEFINITIONS (SYNC WRAPPERS) ---
 
 @celery_app.task(name='app.background.tasks.process_historical_upload_task')
 def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
