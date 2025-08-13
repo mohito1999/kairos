@@ -21,7 +21,7 @@ from app.models.agent import Agent
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
 from app.models.human_interaction import HumanInteraction
-from app.models.learned_pattern import LearnedPattern # Remove PatternStatus import
+from app.models.learned_pattern import LearnedPattern, PatternStatusEnum
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.suggested_opportunity import SuggestedOpportunity
@@ -36,7 +36,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from scipy.stats import ttest_ind
 
-# --- ROBUST ASYNC TASK RUNNER ---
 def run_async_task(async_func, *args, **kwargs):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -44,20 +43,13 @@ def run_async_task(async_func, *args, **kwargs):
         return loop.run_until_complete(async_func(*args, **kwargs))
     finally:
         tasks = asyncio.all_tasks(loop=loop)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        for task in tasks: task.cancel()
+        if tasks: loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
-# --- ASYNC HELPER FUNCTIONS ---
 async def is_duplicate_pattern(session: AsyncSession, new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
-    # FIX: Compare status to a simple string
-    stmt = select(LearnedPattern).where(
-        LearnedPattern.agent_id == agent_id, 
-        LearnedPattern.status == "ACTIVE"
-    )
+    stmt = select(LearnedPattern).where(LearnedPattern.agent_id == agent_id, LearnedPattern.status == PatternStatusEnum.ACTIVE)
     existing_patterns = (await session.execute(stmt)).scalars().all()
     if not existing_patterns: return False
     
@@ -76,8 +68,6 @@ def is_quality_pattern(pattern_json: dict) -> bool:
     trigger = pattern_json.get("trigger_context_summary", "").lower()
     if len(strategy.split()) < 4 or len(trigger.split()) < 3: return False
     return True
-
-# --- ASYNC ORCHESTRATORS ---
 
 async def _async_process_historical_upload(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     engine = create_async_engine(settings.DATABASE_URL)
@@ -109,8 +99,7 @@ async def _async_process_historical_upload(upload_id: str, file_content_bytes: b
                     raw_outcome = raw_outcome_val
                 elif outcome_goal and response_text:
                     is_success = (await llm_service.get_json_response(
-                        "You are an AI evaluator. Respond with JSON {\"is_success\": boolean} based on if the transcript meets the goal.",
-                        f"GOAL: \"{outcome_goal}\"\nTRANSCRIPT:\n{response_text}"
+                        "You are an AI evaluator...", f"GOAL: \"{outcome_goal}\"\nTRANSCRIPT:\n{response_text}"
                     )).get("is_success", False)
                     raw_outcome = "judged_by_ai"
                 
@@ -142,8 +131,7 @@ async def _async_split_historical_data(upload_id: str):
         successful_interactions = (await db.execute(stmt)).scalars().all()
         
         if len(successful_interactions) < 10:
-            training_ids = [i.id for i in successful_interactions]
-            holdout_ids = []
+            training_ids, holdout_ids = [i.id for i in successful_interactions], []
         else:
             training_ids, holdout_ids = train_test_split([i.id for i in successful_interactions], test_size=0.3, random_state=42)
 
@@ -179,11 +167,10 @@ async def _async_extract_patterns_from_history(upload_id: str):
         dbscan = DBSCAN(eps=0.5, min_samples=3, metric="cosine")
         clusters = dbscan.fit_predict(np.array(valid_embeddings))
         
-        battlegrounds = {}
-        for i, cluster_id in enumerate(clusters):
-            if cluster_id != -1: battlegrounds.setdefault(cluster_id, []).append(valid_interactions[i])
+        battlegrounds = {cid: [] for cid in np.unique(clusters) if cid != -1}
+        for i, cid in enumerate(clusters):
+            if cid != -1: battlegrounds[cid].append(valid_interactions[i])
 
-        print(f"Discovered {len(battlegrounds)} battlegrounds.")
         patterns_to_create = []
         for cluster_id, losing_interactions in battlegrounds.items():
             losing_centroid_embeddings = [emb for inter in losing_interactions for emb in await embedding_service.get_embeddings([inter.original_response]) if emb]
@@ -204,14 +191,14 @@ async def _async_extract_patterns_from_history(upload_id: str):
             positive_snippets = [i.original_response for i in winning_interactions[:5]]
             negative_snippets = [i.original_response for i in losing_interactions[:5]]
             
-            system_prompt = "You are a sales coach. Analyze failed vs successful conversation snippets... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
+            system_prompt = "You are a sales coach... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
             user_prompt = f"FAILED SNIPPETS:\n{json.dumps(negative_snippets)}\n\nSUCCESSFUL SNIPPETS:\n{json.dumps(positive_snippets)}\n\nWhat is the battleground and the specific, winning strategy?"
             
             pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
 
             if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(db, pattern_json["suggested_strategy"], upload.agent_id):
                 patterns_to_create.append(LearnedPattern(
-                    agent_id=upload.agent_id, source="HISTORICAL_CONTRASTIVE", status="CANDIDATE", source_upload_id=upload.id,
+                    agent_id=upload.agent_id, source="HISTORICAL_CONTRASTIVE", status=PatternStatusEnum.CANDIDATE, source_upload_id=upload.id,
                     battleground_context={"cluster_id": int(cluster_id)}, positive_examples={"transcripts": positive_snippets},
                     negative_examples={"transcripts": negative_snippets}, trigger_context_summary=pattern_json["trigger_context_summary"],
                     suggested_strategy=pattern_json["suggested_strategy"],
@@ -237,15 +224,16 @@ async def _async_validate_patterns(upload_id: str):
         
         update_query = update(LearnedPattern).where(
             LearnedPattern.source_upload_id == upload.id,
-            LearnedPattern.status == 'CANDIDATE'
+            LearnedPattern.status == PatternStatusEnum.CANDIDATE
         )
 
         if not holdout_ids:
-            await db.execute(update_query.values(status='VALIDATED'))
+            await db.execute(update_query.values(status=PatternStatusEnum.VALIDATED))
             upload.status = "COMPLETED"; await db.commit(); return
 
         candidate_patterns = (await db.execute(select(LearnedPattern).where(
-            LearnedPattern.source_upload_id == upload.id, LearnedPattern.status == 'CANDIDATE'
+            LearnedPattern.source_upload_id == upload.id, 
+            LearnedPattern.status == PatternStatusEnum.CANDIDATE  # Changed from 'CANDIDATE'
         ))).scalars().all()
 
         for pattern in candidate_patterns:
@@ -255,11 +243,11 @@ async def _async_validate_patterns(upload_id: str):
             uplift = np.mean(treatment_outcomes) - np.mean(control_outcomes)
 
             if p_value < 0.1 and uplift > 0:
-                pattern.status = "VALIDATED"
+                pattern.status = PatternStatusEnum.VALIDATED  # Changed from "VALIDATED"
                 pattern.uplift_score = uplift
                 pattern.p_value = p_value
             else:
-                pattern.status = "REJECTED"
+                pattern.status = PatternStatusEnum.REJECTED  # Changed from "REJECTED"
         
         upload.status = "COMPLETED"
         await db.commit()
@@ -275,8 +263,7 @@ async def _async_process_human_interaction(agent_id: str, recording_url: str, co
         is_success = bool(explicit_outcome.get("success", False)) if explicit_outcome else None
         if outcome_goal and transcript:
             is_success = (await llm_service.get_json_response(
-                "You are an AI evaluator. Respond with JSON {\"is_success\": boolean} based on if the transcript meets the goal.",
-                f"GOAL: \"{outcome_goal}\"\nTRANSCRIPT:\n{transcript}"
+                "You are an AI evaluator...", f"GOAL: \"{outcome_goal}\"\nTRANSCRIPT:\n{transcript}"
             )).get("is_success", False)
         
         agent = await db.get(Agent, uuid.UUID(agent_id))
@@ -289,8 +276,7 @@ async def _async_process_human_interaction(agent_id: str, recording_url: str, co
         await db.commit()
     await engine.dispose()
 
-# --- CELERY TASK DEFINITIONS (SYNC WRAPPERS) ---
-
+# --- CELERY TASK DEFINITIONS ---
 @celery_app.task(name='app.background.tasks.process_historical_upload_task')
 def process_historical_upload_task(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     run_async_task(_async_process_historical_upload, upload_id, file_content_bytes, data_mapping)

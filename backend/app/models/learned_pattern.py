@@ -1,10 +1,17 @@
 import uuid
-from sqlalchemy import Column, String, Text, Integer, DateTime, ForeignKey, func, JSON, Float
+from sqlalchemy import Column, String, Text, Integer, DateTime, ForeignKey, func, JSON, Float, Enum
 from sqlalchemy.dialects.postgresql import UUID
 from pgvector.sqlalchemy import Vector
+import enum
 from app.models.base import Base
 
-# NOTE: The PatternStatus enum class is REMOVED from this file.
+# Define the enum class to match your database
+class PatternStatusEnum(enum.Enum):
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    VALIDATED = "VALIDATED"
+    REJECTED = "REJECTED"
+    ARCHIVED = "ARCHIVED"
 
 class LearnedPattern(Base):
     __tablename__ = 'learned_patterns'
@@ -31,8 +38,13 @@ class LearnedPattern(Base):
     impressions = Column(Integer, nullable=False, default=0)
     success_count = Column(Integer, nullable=False, default=0)
     
-    # THIS IS THE FIX: We define status as a simple String, matching the database.
-    status = Column(String, nullable=False, default='CANDIDATE', index=True)
+    # FIXED: Use Enum type to match the database schema
+    status = Column(
+        Enum(PatternStatusEnum, name='pattern_status_enum'), 
+        nullable=False, 
+        default=PatternStatusEnum.CANDIDATE,
+        index=True
+    )
     
     version = Column(Integer, nullable=False, default=1)
     parent_pattern_id = Column(UUID(as_uuid=True), ForeignKey('learned_patterns.id'), nullable=True)
