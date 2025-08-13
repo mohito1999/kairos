@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, func
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, func, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.models.base import Base
@@ -15,6 +15,8 @@ class HistoricalUpload(Base):
     total_interactions = Column(Integer, nullable=True)
     processed_interactions = Column(Integer, nullable=False, default=0)
     status = Column(String, nullable=False) # e.g., UPLOADING, PROCESSING, COMPLETED, FAILED
+
+    interaction_id_split = Column(JSON, nullable=True)
 
     upload_timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     processing_completed_timestamp = Column(DateTime(timezone=True), nullable=True)
