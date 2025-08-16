@@ -135,3 +135,21 @@ async def trigger_live_learning_for_agent(
         args=[str(agent_id)]
     )
     return {"message": "Live learning task triggered successfully."}
+
+@router.post("/trigger-opportunity-generation/{organization_id}", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_opportunity_generation_for_org(
+    organization_id: uuid.UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    DEBUGGING ENDPOINT: Manually triggers the opportunity generation task for an organization.
+    """
+    # Security check: ensure the user belongs to the organization they are triggering the task for.
+    if current_user.organization_id != organization_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to trigger task for this organization")
+
+    celery_app.send_task(
+        'app.background.tasks.generate_opportunities_task',
+        args=[str(organization_id)]
+    )
+    return {"message": "Opportunity generation task triggered successfully."}

@@ -98,7 +98,7 @@ async def assess_interaction_outcome(
     assessment_json = await llm_service.get_json_response(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        model="openai/gpt-4o" # Use a powerful model for this reasoning task
+        model="openai/gpt-4o-mini" # Use a powerful model for this reasoning task
     )
 
     if not assessment_json or "is_success" not in assessment_json:

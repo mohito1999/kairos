@@ -76,6 +76,7 @@ def seed_live_data(agent_id):
         session.execute(text("DELETE FROM interactions WHERE agent_id = :agent_id"), {"agent_id": agent_id})
 
         interactions_data = [
+            # Battleground: Price Objection (21 interactions to be safe)
             {"transcript": "User: That's too expensive. Agent: I understand, but it's a good value.", "is_success": False, "context": {"topic": "price"}},
             {"transcript": "User: Your price is too high. Agent: It seems high, but let me explain the value.", "is_success": False, "context": {"topic": "price"}},
             {"transcript": "User: I can't afford that. Agent: Let's see if we can find a promotion for you.", "is_success": True, "context": {"topic": "price"}},
@@ -83,7 +84,22 @@ def seed_live_data(agent_id):
             {"transcript": "User: The cost is a problem. Agent: I understand. Many clients feel that way at first, but find the ROI is worth it.", "is_success": True, "context": {"topic": "price"}},
             {"transcript": "User: It costs too much. Agent: Okay.", "is_success": False, "context": {"topic": "price"}},
             {"transcript": "User: Is there a discount? Agent: Let me check for any available discounts for you.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: That price is more than I expected. Agent: I can see why you'd say that, let's review the features.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: It's just not in my budget. Agent: We can look at a payment plan.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: Your competitor is cheaper. Agent: They are, but they don't offer 24/7 support.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: I need a better price. Agent: I'm sorry, our prices are fixed.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: Can you do any better on the price? Agent: What price were you hoping for?", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: That's a lot of money. Agent: It is, but it's a one-time investment.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: The price is a deal-breaker. Agent: I understand. Thanks for your time.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: I'm not paying that much. Agent: Our pricing is competitive for the value provided.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: Is that your best price? Agent: For this package, yes it is.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: I can get it cheaper elsewhere. Agent: I understand, but our quality is unmatched.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: It's over my budget. Agent: I see. Let me put you on my list for future sales.", "is_success": False, "context": {"topic": "price"}},
+            {"transcript": "User: Too steep for me. Agent: Perhaps a lower tier plan would be a better fit?", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: I'm shocked by the price. Agent: I apologize for the surprise. Let's break it down.", "is_success": True, "context": {"topic": "price"}},
+            {"transcript": "User: I can't justify the cost. Agent: I understand your position.", "is_success": False, "context": {"topic": "price"}},
         ]
+
 
         for data in interactions_data:
             interaction_id = uuid.uuid4()

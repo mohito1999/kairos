@@ -1,3 +1,4 @@
+#backend/app/background/tasks.py
 import uuid
 import json
 import numpy as np
@@ -21,7 +22,7 @@ from app.models.agent import Agent
 from app.models.historical_upload import HistoricalUpload
 from app.models.historical_interaction import HistoricalInteraction
 from app.models.human_interaction import HumanInteraction
-from app.models.learned_pattern import LearnedPattern, PatternStatusEnum
+from app.models.learned_pattern import LearnedPattern
 from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.suggested_opportunity import SuggestedOpportunity
@@ -36,6 +37,31 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from scipy.stats import ttest_ind
 
+class PseudoInteraction:
+    """A simple, plain data object to mimic HistoricalInteraction for in-memory processing."""
+    def __init__(self, context, response, success):
+        self.original_context = context
+        self.original_response = response
+        self.is_success = success
+
+async def get_final_user_statement(transcript: str) -> str:
+    """Uses an LLM to extract the final user statement that the agent responded to."""
+    system_prompt = "You are a text analysis expert. Your task is to extract the very last user statement from a conversation transcript. Return only that single statement as plain text, not JSON."
+    user_prompt = f"Here is the transcript:\n---\n{transcript}\n---\nWhat was the final user statement?"
+    
+    try:
+        # Use get_completion instead of get_json_response since we want plain text
+        response = await llm_service.get_completion(
+            system_prompt, 
+            user_prompt, 
+            model="openai/gpt-4o-mini"
+        )
+        return response.strip() if response else transcript
+    except Exception as e:
+        print(f"Warning: Failed to extract final user statement: {e}")
+        return transcript  # Fallback to the full transcript on error
+
+
 def run_async_task(async_func, *args, **kwargs):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -49,7 +75,7 @@ def run_async_task(async_func, *args, **kwargs):
         asyncio.set_event_loop(None)
 
 async def is_duplicate_pattern(session: AsyncSession, new_pattern_strategy: str, agent_id: uuid.UUID) -> bool:
-    stmt = select(LearnedPattern).where(LearnedPattern.agent_id == agent_id, LearnedPattern.status == PatternStatusEnum.ACTIVE)
+    stmt = select(LearnedPattern).where(LearnedPattern.agent_id == agent_id, LearnedPattern.status == "ACTIVE")
     existing_patterns = (await session.execute(stmt)).scalars().all()
     if not existing_patterns: return False
     
@@ -72,80 +98,288 @@ def is_quality_pattern(pattern_json: dict) -> bool:
 async def _async_run_contrastive_engine(
     db: AsyncSession, 
     agent_id: uuid.UUID, 
-    interactions: List[HistoricalInteraction],
+    interactions: List,
     source: str,
     source_upload_id: Optional[uuid.UUID] = None
 ):
     """
-    This is the refactored, reusable core of the Contrastive Engine.
-    It takes a list of interactions and discovers patterns from them.
+    Enhanced contrastive engine that compares final user statements rather than full transcripts
+    for more precise pattern matching.
     """
-    failed_interactions = [i for i in interactions if not i.is_success and i.original_response]
+    
+    # Filter failed interactions with valid transcripts
+    failed_interactions = [
+        i for i in interactions 
+        if not getattr(i, 'is_success', False) and getattr(i, 'original_response', None)
+    ]
+    
     if len(failed_interactions) < 5:
         print(f"Engine: Not enough failed interactions ({len(failed_interactions)}) to run.")
         return
 
-    # A. OPPORTUNITY DISCOVERY
-    failed_transcripts = [i.original_response for i in failed_interactions]
-    failed_embeddings_list = await embedding_service.get_embeddings(failed_transcripts)
-    valid_embeddings = [emb for emb in failed_embeddings_list if emb]
-    valid_interactions = [inter for i, inter in enumerate(failed_interactions) if failed_embeddings_list[i]]
-    if len(valid_embeddings) < 5: return
+    print(f"Engine: Processing {len(failed_interactions)} failed interactions.")
 
-    dbscan = DBSCAN(eps=0.5, min_samples=3, metric="cosine")
+    # A. OPPORTUNITY DISCOVERY (Based on final user statements)
+    try:
+        failed_user_statements = await asyncio.gather(
+            *[get_final_user_statement(getattr(i, 'original_response', '')) for i in failed_interactions],
+            return_exceptions=True
+        )
+        
+        # Filter out exceptions and empty statements
+        valid_statements = []
+        valid_failed_interactions = []
+        for i, statement in enumerate(failed_user_statements):
+            if not isinstance(statement, Exception) and statement and statement.strip():
+                valid_statements.append(statement)
+                valid_failed_interactions.append(failed_interactions[i])
+        
+        if len(valid_statements) < 5:
+            print(f"Engine: Not enough valid user statements ({len(valid_statements)}) extracted.")
+            return
+            
+        print(f"Engine: Extracted {len(valid_statements)} valid final user statements.")
+        
+    except Exception as e:
+        print(f"Engine: Error extracting user statements: {e}")
+        return
+
+    # Get embeddings for user statements
+    failed_embeddings_list = await embedding_service.get_embeddings(valid_statements)
+    valid_embeddings = [emb for emb in failed_embeddings_list if emb]
+    final_valid_interactions = [valid_failed_interactions[i] for i, emb in enumerate(failed_embeddings_list) if emb]
+    
+    if len(valid_embeddings) < 5:
+        print(f"Engine: Not enough valid embeddings ({len(valid_embeddings)}) generated.")
+        return
+
+    print(f"Engine: Generated {len(valid_embeddings)} valid embeddings for clustering.")
+
+    # Use more lenient clustering parameters for live data
+    eps_value = 0.4 if source == "LIVE_DISCOVERED" else 0.5
+    min_samples = 2 if source == "LIVE_DISCOVERED" else 3
+    
+    # Cluster the user statements
+    dbscan = DBSCAN(eps=eps_value, min_samples=min_samples, metric="cosine")
     clusters = dbscan.fit_predict(np.array(valid_embeddings))
     
     battlegrounds = {}
     for i, cluster_id in enumerate(clusters):
-        if cluster_id != -1: battlegrounds.setdefault(cluster_id, []).append(valid_interactions[i])
+        if cluster_id != -1:
+            battlegrounds.setdefault(cluster_id, []).append(final_valid_interactions[i])
 
     print(f"Engine: Discovered {len(battlegrounds)} battlegrounds.")
+    
+    if not battlegrounds:
+        print("Engine: No battlegrounds found. Exiting.")
+        return
+
     patterns_to_create = []
 
     # B. CONTRASTIVE ANALYSIS
     for cluster_id, losing_interactions in battlegrounds.items():
-        losing_centroid_embeddings = [emb for inter in losing_interactions for emb in await embedding_service.get_embeddings([inter.original_response]) if emb]
-        if not losing_centroid_embeddings: continue
-        losing_centroid = np.mean(losing_centroid_embeddings, axis=0)
+        print(f"Engine: Analyzing battleground {cluster_id} with {len(losing_interactions)} losing interactions.")
         
-        successful_interactions = [i for i in interactions if i.is_success]
-        if not successful_interactions: continue
+        # Extract final user statements from losing interactions
+        try:
+            losing_user_statements = await asyncio.gather(
+                *[get_final_user_statement(getattr(i, 'original_response', '')) for i in losing_interactions],
+                return_exceptions=True
+            )
+            
+            # Filter valid statements
+            valid_losing_statements = [
+                stmt for stmt in losing_user_statements 
+                if not isinstance(stmt, Exception) and stmt and stmt.strip()
+            ]
+            
+            if not valid_losing_statements:
+                print(f"Engine: No valid losing statements for battleground {cluster_id}. Skipping.")
+                continue
+                
+        except Exception as e:
+            print(f"Engine: Error processing losing statements for battleground {cluster_id}: {e}")
+            continue
 
-        successful_transcripts = [i.original_response for i in successful_interactions]
-        successful_embeddings = await embedding_service.get_embeddings(successful_transcripts)
+        # Calculate losing centroid
+        losing_embeddings = await embedding_service.get_embeddings(valid_losing_statements)
+        valid_losing_embeddings = [emb for emb in losing_embeddings if emb]
         
-        winning_interactions = [successful_interactions[i] for i, emb in enumerate(successful_embeddings) if emb and cosine_similarity([losing_centroid], [emb])[0][0] > 0.8]
-
-        if len(winning_interactions) < 2 or len(losing_interactions) < 2: continue
-
-        # C. PATTERN CREATION
-        positive_snippets = [i.original_response for i in winning_interactions[:5]]
-        negative_snippets = [i.original_response for i in losing_interactions[:5]]
+        if not valid_losing_embeddings:
+            print(f"Engine: No valid embeddings for losing statements in battleground {cluster_id}. Skipping.")
+            continue
+            
+        losing_centroid = np.mean(valid_losing_embeddings, axis=0)
         
-        system_prompt = "You are a sales coach... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
+        # Find successful interactions
+        successful_interactions = [i for i in interactions if getattr(i, 'is_success', False)]
+        if not successful_interactions:
+            print(f"Engine: No successful interactions to contrast against for battleground {cluster_id}. Skipping.")
+            continue
+
+        print(f"Engine: Found {len(successful_interactions)} successful interactions for battleground {cluster_id}.")
+
+        # Extract final user statements from successful interactions
+        try:
+            successful_user_statements = await asyncio.gather(
+                *[get_final_user_statement(getattr(i, 'original_response', '')) for i in successful_interactions],
+                return_exceptions=True
+            )
+            
+            valid_successful_statements = []
+            valid_successful_interactions = []
+            for i, stmt in enumerate(successful_user_statements):
+                if not isinstance(stmt, Exception) and stmt and stmt.strip():
+                    valid_successful_statements.append(stmt)
+                    valid_successful_interactions.append(successful_interactions[i])
+            
+            if not valid_successful_statements:
+                print(f"Engine: No valid successful statements for battleground {cluster_id}. Skipping.")
+                continue
+                
+        except Exception as e:
+            print(f"Engine: Error processing successful statements for battleground {cluster_id}: {e}")
+            continue
+
+        # Get embeddings for successful statements
+        successful_embeddings = await embedding_service.get_embeddings(valid_successful_statements)
+        
+        # MODIFIED: Use more lenient similarity threshold and fallback strategy
+        similarity_threshold = 0.70 if source == "LIVE_DISCOVERED" else 0.85
+        
+        # Find winning interactions (successful ones with similar user statements to losing centroid)
+        winning_interactions = []
+        similarities = []
+        
+        for i, emb in enumerate(successful_embeddings):
+            if emb is not None:
+                similarity = cosine_similarity([losing_centroid], [emb])[0][0]
+                similarities.append((similarity, valid_successful_interactions[i]))
+        
+        # Sort by similarity and take the most similar ones
+        similarities.sort(reverse=True, key=lambda x: x[0])
+        
+        # Take top matches that meet the threshold
+        for similarity, interaction in similarities:
+            if similarity > similarity_threshold:
+                winning_interactions.append(interaction)
+        
+        # NEW: Fallback strategy - if we don't have enough matches, lower the threshold
+        if len(winning_interactions) < 2 and similarities:
+            print(f"Engine: Lowering similarity threshold for battleground {cluster_id} due to insufficient matches.")
+            # Take the top 3 most similar successful interactions regardless of threshold
+            for similarity, interaction in similarities[:3]:
+                if interaction not in winning_interactions:
+                    winning_interactions.append(interaction)
+                if len(winning_interactions) >= 3:
+                    break
+
+        print(f"Engine: Found {len(winning_interactions)} winning interactions for battleground {cluster_id}.")
+
+        # Relax the minimum requirements for live data
+        min_winning = 2 if source == "LIVE_DISCOVERED" else 2
+        min_losing = 2 if source == "LIVE_DISCOVERED" else 2
+        
+        if len(winning_interactions) < min_winning or len(losing_interactions) < min_losing:
+            print(f"Engine: Insufficient interactions for pattern creation in battleground {cluster_id}. "
+                  f"Need {min_winning} winning and {min_losing} losing, have {len(winning_interactions)} and {len(losing_interactions)}. Skipping.")
+            continue
+
+        # C. PATTERN CREATION (using full transcripts for context)
+        positive_snippets = []
+        negative_snippets = []
+        
+        for interaction in winning_interactions[:5]:
+            transcript = getattr(interaction, 'original_response', '')
+            if transcript:
+                positive_snippets.append(transcript)
+        
+        for interaction in losing_interactions[:5]:
+            transcript = getattr(interaction, 'original_response', '')
+            if transcript:
+                negative_snippets.append(transcript)
+        
+        if not positive_snippets or not negative_snippets:
+            print(f"Engine: Could not extract snippets for battleground {cluster_id}. Skipping.")
+            continue
+
+        # Generate pattern using LLM
+        system_prompt = "You are a sales coach analyzing conversation patterns. Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
         user_prompt = f"FAILED SNIPPETS:\n{json.dumps(negative_snippets)}\n\nSUCCESSFUL SNIPPETS:\n{json.dumps(positive_snippets)}\n\nWhat is the battleground and the specific, winning strategy?"
         
-        pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
+        try:
+            pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o-mini")
+        except Exception as e:
+            print(f"Engine: Error generating pattern for battleground {cluster_id}: {e}")
+            continue
 
-        if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(db, pattern_json["suggested_strategy"], agent_id):
-            patterns_to_create.append(LearnedPattern(
-                agent_id=agent_id, source=source, status="CANDIDATE", source_upload_id=source_upload_id,
-                battleground_context={"cluster_id": int(cluster_id)}, positive_examples={"transcripts": positive_snippets},
-                negative_examples={"transcripts": negative_snippets}, trigger_context_summary=pattern_json["trigger_context_summary"],
+        if not pattern_json:
+            print(f"Engine: No pattern generated for battleground {cluster_id}.")
+            continue
+
+        # Validate required keys
+        if not pattern_json.get("trigger_context_summary") or not pattern_json.get("suggested_strategy"):
+            print(f"Engine: Pattern missing required keys for battleground {cluster_id}.")
+            continue
+
+        # Quality check
+        if not is_quality_pattern(pattern_json):
+            print(f"Engine: Pattern failed quality check for battleground {cluster_id}.")
+            continue
+
+        # Deduplication check (only for historical data)
+        should_deduplicate = (source == "HISTORICAL_CONTRASTIVE")
+        is_duplicate = False
+        if should_deduplicate:
+            try:
+                is_duplicate = await is_duplicate_pattern(db, pattern_json["suggested_strategy"], agent_id)
+            except Exception as e:
+                print(f"Engine: Error checking duplicates for battleground {cluster_id}: {e}")
+                continue
+
+        if is_duplicate:
+            print(f"Engine: Pattern is duplicate for battleground {cluster_id}. Skipping.")
+            continue
+
+        # Create the pattern
+        try:
+            new_pattern = LearnedPattern(
+                agent_id=agent_id, 
+                source=source, 
+                status="CANDIDATE", 
+                source_upload_id=source_upload_id,
+                battleground_context={"cluster_id": int(cluster_id)}, 
+                positive_examples={"transcripts": positive_snippets},
+                negative_examples={"transcripts": negative_snippets}, 
+                trigger_context_summary=pattern_json["trigger_context_summary"],
                 suggested_strategy=pattern_json["suggested_strategy"],
-            ))
-    
+            )
+            patterns_to_create.append(new_pattern)
+            print(f"Engine: Created pattern for battleground {cluster_id}: '{pattern_json['suggested_strategy'][:50]}...'")
+        except Exception as e:
+            print(f"Engine: Error creating pattern object for battleground {cluster_id}: {e}")
+            continue
+
+    # Commit patterns to database
     if patterns_to_create:
         print(f"Engine: Discovered {len(patterns_to_create)} new candidate patterns from source '{source}'.")
-        db.add_all(patterns_to_create)
-        await db.commit()
-        # If this came from a historical upload, we trigger validation
-        if source_upload_id:
-            upload = await db.get(HistoricalUpload, source_upload_id)
-            if upload:
-                upload.status = "VALIDATING"
-                await db.commit()
-                celery_app.send_task('app.background.tasks.validate_patterns_task', args=[str(source_upload_id)])
+        try:
+            db.add_all(patterns_to_create)
+            await db.commit()
+            print(f"Engine: Successfully committed {len(patterns_to_create)} patterns to database.")
+            
+            # Trigger validation for historical uploads
+            if source_upload_id:
+                upload = await db.get(HistoricalUpload, source_upload_id)
+                if upload:
+                    upload.status = "VALIDATING"
+                    await db.commit()
+                    celery_app.send_task('app.background.tasks.validate_patterns_task', args=[str(source_upload_id)])
+        except Exception as e:
+            print(f"Engine: Error committing patterns to database: {e}")
+            await db.rollback()
+    else:
+        print(f"Engine: No patterns were created from source '{source}'.")
 
 async def _async_process_historical_upload(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     engine = create_async_engine(settings.DATABASE_URL)
@@ -257,20 +491,23 @@ async def _async_discover_patterns_from_live_data(agent_id: str):
 
         if len(recent_interactions) < 20:
             print(f"Live Learning: Not enough interactions ({len(recent_interactions)}) for agent {agent_id}.")
+            await engine.dispose()
             return
 
+        # --- THE DEFINITIVE FIX ---
+        # Create plain Python objects, not SQLAlchemy model instances.
         pseudo_historical_interactions = [
-            HistoricalInteraction(
-                original_context=inter.context,
-                original_response=inter.full_transcript,
-                is_success=inter.outcome.is_success if inter.outcome else False
-            ) for inter in recent_interactions if inter.outcome
+            PseudoInteraction(
+                context=inter.context,
+                response=inter.full_transcript,
+                success=inter.outcome.is_success if inter.outcome else False
+            ) for inter in recent_interactions if inter.outcome and inter.full_transcript
         ]
         
         await _async_run_contrastive_engine(
             db=db,
             agent_id=uuid.UUID(agent_id),
-            interactions=pseudo_historical_interactions,
+            interactions=pseudo_historical_interactions, # Pass the list of plain objects
             source="LIVE_DISCOVERED"
         )
     await engine.dispose()
@@ -284,20 +521,30 @@ async def _async_generate_opportunities(organization_id: str):
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
         
+        # 1. Fetch all agents for the organization first
+        org_uuid = uuid.UUID(organization_id)
+        agent_stmt = select(Agent.id).where(Agent.organization_id == org_uuid)
+        agent_ids = (await db.execute(agent_stmt)).scalars().all()
+
+        if not agent_ids:
+            print(f"Opportunity Engine: No agents found for organization {organization_id}.")
+            await engine.dispose()
+            return
+
+        
         # 1. Fetch all failed interactions for the entire organization
         stmt = select(Interaction).join(Outcome).where(
-            Interaction.agent_id.in_(
-                select(Agent.id).where(Agent.organization_id == uuid.UUID(organization_id))
-            ),
+            Interaction.agent_id.in_(agent_ids),
             Outcome.is_success == False,
             Interaction.full_transcript.is_not(None)
         )
         failed_interactions = (await db.execute(stmt)).scalars().all()
 
-        if len(failed_interactions) < 20: # Minimum threshold for opportunity analysis
+        if len(failed_interactions) < 20: # Minimum threshold
             print(f"Opportunity Engine: Not enough failed interactions ({len(failed_interactions)}) for organization {organization_id}.")
             await engine.dispose()
             return
+
 
         # 2. Cluster transcripts to find thematic groups of failures
         transcripts = [i.full_transcript for i in failed_interactions]
@@ -343,7 +590,7 @@ async def _async_generate_opportunities(organization_id: str):
             """
 
             opportunity_json = await llm_service.get_json_response(
-                system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o"
+                system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o-mini"
             )
 
             if opportunity_json and "title" in opportunity_json and "description" in opportunity_json:

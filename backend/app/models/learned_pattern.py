@@ -1,3 +1,4 @@
+#backend/app/models/learned_pattern.py
 import uuid
 from sqlalchemy import Column, String, Text, Integer, DateTime, ForeignKey, func, JSON, Float, Enum
 from sqlalchemy.dialects.postgresql import UUID

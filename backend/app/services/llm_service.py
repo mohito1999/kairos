@@ -1,3 +1,4 @@
+#backend/app/services/llm_service.py
 from openai import AsyncOpenAI
 from app.core.config import settings
 import json
@@ -28,3 +29,22 @@ async def get_json_response(system_prompt: str, user_prompt: str, model: str = "
         print(f"Error getting JSON response from LLM: {e}")
         # In a real app, we'd have more robust error handling and logging here
         return {}
+    
+async def get_completion(system_prompt: str, user_prompt: str, model: str = "openai/gpt-4o-mini") -> str:
+    """
+    Gets a plain text completion from an LLM via OpenRouter.
+    """
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            # Note: No response_format for plain text
+        )
+        content = response.choices[0].message.content
+        return content if content else ""
+    except Exception as e:
+        print(f"Error getting completion from LLM: {e}")
+        return ""
