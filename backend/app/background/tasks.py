@@ -214,43 +214,139 @@ async def _async_extract_patterns_from_history(upload_id: str):
     await engine.dispose()
 
 async def _async_validate_patterns(upload_id: str):
+    """
+    The async core of the pattern validation task. This function performs a
+    rigorous statistical test for each candidate pattern against the holdout set.
+    """
     engine = create_async_engine(settings.DATABASE_URL)
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
+        # 1. Load Upload and Holdout Data
         upload = await db.get(HistoricalUpload, uuid.UUID(upload_id))
-        if not upload or not upload.interaction_id_split: return
+        if not upload or not upload.interaction_id_split:
+            print(f"Validation Error: Upload {upload_id} or its split data not found.")
+            return
 
-        holdout_ids = [uuid.UUID(id_str) for id_str in upload.interaction_id_split.get("holdout_set", [])]
-        
-        update_query = update(LearnedPattern).where(
-            LearnedPattern.source_upload_id == upload.id,
-            LearnedPattern.status == PatternStatusEnum.CANDIDATE
-        )
+        holdout_ids_str = upload.interaction_id_split.get("holdout_set", [])
+        if not holdout_ids_str:
+            print(f"No holdout set for upload {upload_id}. Auto-promoting CANDIDATE patterns to VALIDATED.")
+            stmt = update(LearnedPattern).where(
+                LearnedPattern.source_upload_id == upload.id,
+                LearnedPattern.status == 'CANDIDATE'
+            ).values(status='VALIDATED')
+            await db.execute(stmt)
+            upload.status = "COMPLETED"
+            await db.commit()
+            await engine.dispose()
+            return
+            
+        holdout_ids = [uuid.UUID(id_str) for id_str in holdout_ids_str]
+        holdout_interactions = (await db.execute(
+            select(HistoricalInteraction).where(HistoricalInteraction.id.in_(holdout_ids))
+        )).scalars().all()
 
-        if not holdout_ids:
-            await db.execute(update_query.values(status=PatternStatusEnum.VALIDATED))
-            upload.status = "COMPLETED"; await db.commit(); return
-
+        # 2. Get all Candidate Patterns for this Upload
         candidate_patterns = (await db.execute(select(LearnedPattern).where(
             LearnedPattern.source_upload_id == upload.id, 
-            LearnedPattern.status == PatternStatusEnum.CANDIDATE  # Changed from 'CANDIDATE'
+            LearnedPattern.status == 'CANDIDATE'
         ))).scalars().all()
+        
+        print(f"Found {len(candidate_patterns)} candidate patterns to validate against a holdout set of {len(holdout_interactions)}.")
+        if not candidate_patterns:
+            upload.status = "COMPLETED"
+            await db.commit()
+            await engine.dispose()
+            return
 
+        # Pre-fetch all necessary embeddings for the holdout set to avoid repeated calls
+        holdout_transcripts = [i.original_response for i in holdout_interactions]
+        holdout_embeddings = await embedding_service.get_embeddings(holdout_transcripts)
+        
+        # Create a map for easy lookup
+        interaction_embedding_map = {
+            holdout_interactions[i].id: emb 
+            for i, emb in enumerate(holdout_embeddings) if emb
+        }
+
+        # 3. Iterate through each Candidate Pattern and Validate
         for pattern in candidate_patterns:
-            treatment_outcomes = [1, 1, 0, 1, 1]
-            control_outcomes = [0, 1, 0, 0, 1]
-            _, p_value = ttest_ind(treatment_outcomes, control_outcomes, equal_var=False)
+            # The "battleground" is defined by the centroid of the failures that created the pattern
+            losing_examples = pattern.negative_examples.get("transcripts", [])
+            if not losing_examples:
+                pattern.status = "REJECTED"
+                print(f"Pattern {pattern.id} rejected: No negative examples to define battleground.")
+                continue
+
+            losing_embeddings = await embedding_service.get_embeddings(losing_examples)
+            battleground_centroid = np.mean([emb for emb in losing_embeddings if emb], axis=0)
+
+            # 4. Find Relevant Interactions in Holdout Set (Context Matching)
+            relevant_holdout_interactions = []
+            for interaction in holdout_interactions:
+                emb = interaction_embedding_map.get(interaction.id)
+                if emb is not None:
+                    # Check how similar this interaction is to the battleground
+                    similarity = cosine_similarity([battleground_centroid], [emb])[0][0]
+                    if similarity > 0.8: # Threshold for being "in the same situation"
+                        relevant_holdout_interactions.append(interaction)
+            
+            if len(relevant_holdout_interactions) < 10: # Need at least 10 examples for a meaningful test
+                pattern.status = "REJECTED"
+                print(f"Pattern {pattern.id} rejected: Insufficient relevant examples in holdout set ({len(relevant_holdout_interactions)} found).")
+                continue
+
+            # 5. Form Treatment vs. Control Groups
+            treatment_group = []
+            control_group = []
+            strategy_embedding_list = await embedding_service.get_embeddings([pattern.suggested_strategy])
+            if not strategy_embedding_list or not strategy_embedding_list[0]:
+                pattern.status = "REJECTED"
+                print(f"Pattern {pattern.id} rejected: Could not generate embedding for its own strategy.")
+                continue
+            strategy_embedding = strategy_embedding_list[0]
+
+            for interaction in relevant_holdout_interactions:
+                interaction_embedding = interaction_embedding_map.get(interaction.id)
+                if interaction_embedding:
+                    similarity_to_strategy = cosine_similarity([strategy_embedding], [interaction_embedding])[0][0]
+                    if similarity_to_strategy > 0.85: # High threshold to confirm strategy was used
+                        treatment_group.append(interaction)
+                    else:
+                        control_group.append(interaction)
+
+            if len(treatment_group) < 3 or len(control_group) < 3:
+                pattern.status = "REJECTED"
+                print(f"Pattern {pattern.id} rejected: Could not form both treatment ({len(treatment_group)}) and control ({len(control_group)}) groups.")
+                continue
+
+            # 6. Perform Statistical Test
+            treatment_outcomes = [1 if i.is_success else 0 for i in treatment_group]
+            control_outcomes = [1 if i.is_success else 0 for i in control_group]
+            
+            # Ensure there is variance to avoid statistical errors
+            if len(set(treatment_outcomes)) < 2 or len(set(control_outcomes)) < 2:
+                pattern.status = "REJECTED"
+                print(f"Pattern {pattern.id} rejected: No variance in outcomes for statistical test.")
+                continue
+
+            t_stat, p_value = ttest_ind(treatment_outcomes, control_outcomes, equal_var=False)
             uplift = np.mean(treatment_outcomes) - np.mean(control_outcomes)
 
-            if p_value < 0.1 and uplift > 0:
-                pattern.status = PatternStatusEnum.VALIDATED  # Changed from "VALIDATED"
+            print(f"Pattern {pattern.id}: Uplift = {uplift*100:+.2f}%, P-Value = {p_value:.4f}")
+
+            if p_value < 0.05 and uplift > 0: # Stricter p-value for production
+                pattern.status = "VALIDATED"
                 pattern.uplift_score = uplift
                 pattern.p_value = p_value
+                print(f"  -> RESULT: VALIDATED")
             else:
-                pattern.status = PatternStatusEnum.REJECTED  # Changed from "REJECTED"
-        
+                pattern.status = "REJECTED"
+                print(f"  -> RESULT: REJECTED")
+
         upload.status = "COMPLETED"
         await db.commit()
+        print(f"\nValidation complete for upload {upload_id}. Final status: COMPLETED.")
+
     await engine.dispose()
 
 async def _async_process_human_interaction(agent_id: str, recording_url: str, context: Optional[Dict[str, Any]], explicit_outcome: Optional[Dict[str, Any]], outcome_goal: Optional[str]):
