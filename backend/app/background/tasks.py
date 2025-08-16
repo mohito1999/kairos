@@ -275,6 +275,99 @@ async def _async_discover_patterns_from_live_data(agent_id: str):
         )
     await engine.dispose()
 
+# This is the new async helper function. Add it with the others.
+async def _async_generate_opportunities(organization_id: str):
+    """
+    Analyzes all failed interactions for an organization to find strategic opportunities.
+    """
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
+        
+        # 1. Fetch all failed interactions for the entire organization
+        stmt = select(Interaction).join(Outcome).where(
+            Interaction.agent_id.in_(
+                select(Agent.id).where(Agent.organization_id == uuid.UUID(organization_id))
+            ),
+            Outcome.is_success == False,
+            Interaction.full_transcript.is_not(None)
+        )
+        failed_interactions = (await db.execute(stmt)).scalars().all()
+
+        if len(failed_interactions) < 20: # Minimum threshold for opportunity analysis
+            print(f"Opportunity Engine: Not enough failed interactions ({len(failed_interactions)}) for organization {organization_id}.")
+            await engine.dispose()
+            return
+
+        # 2. Cluster transcripts to find thematic groups of failures
+        transcripts = [i.full_transcript for i in failed_interactions]
+        embeddings_list = await embedding_service.get_embeddings(transcripts)
+        
+        valid_embeddings = [emb for emb in embeddings_list if emb]
+        valid_interactions = [inter for i, inter in enumerate(failed_interactions) if embeddings_list[i]]
+        
+        if len(valid_embeddings) < 10:
+            print("Opportunity Engine: Not enough valid embeddings to cluster.")
+            await engine.dispose()
+            return
+            
+        # Use a looser clustering setting to find broader themes
+        dbscan = DBSCAN(eps=0.6, min_samples=5, metric="cosine")
+        clusters = dbscan.fit_predict(np.array(valid_embeddings))
+
+        opportunity_clusters = {}
+        for i, cluster_id in enumerate(clusters):
+            if cluster_id != -1:
+                opportunity_clusters.setdefault(cluster_id, []).append(valid_interactions[i])
+
+        print(f"Opportunity Engine: Found {len(opportunity_clusters)} thematic failure clusters.")
+
+        # 3. For each cluster, use an LLM to synthesize a business opportunity
+        for cluster_id, interactions_in_cluster in opportunity_clusters.items():
+            sample_transcripts = [i.full_transcript for i in interactions_in_cluster[:5]]
+            
+            system_prompt = """
+            You are a sharp-witted business strategy consultant reviewing customer service calls that all resulted in failure.
+            Your task is to analyze these failed conversations and identify the underlying, unmet customer need or a potential new product/service offering. Do not suggest simple conversational improvements. Focus on tangible business or product strategy.
+            Respond in a valid JSON format with three keys: "title", "description", and "suggested_action".
+            - "title": A short, catchy title for the opportunity (e.g., "Untapped Market for Weekend Packages").
+            - "description": A one-paragraph summary of the latent need discovered from the calls.
+            - "suggested_action": A concrete next step for the business (e.g., "Task the product team with scoping a 'Weekend Getaway' package.").
+            """
+            user_prompt = f"""
+            Here are snippets from several failed customer calls that seem to be related:
+            ---
+            {json.dumps(sample_transcripts, indent=2)}
+            ---
+            What is the core business opportunity being missed here?
+            """
+
+            opportunity_json = await llm_service.get_json_response(
+                system_prompt=system_prompt, user_prompt=user_prompt, model="openai/gpt-4o"
+            )
+
+            if opportunity_json and "title" in opportunity_json and "description" in opportunity_json:
+                # Basic de-duplication check
+                existing_opp_stmt = select(SuggestedOpportunity).where(
+                    SuggestedOpportunity.organization_id == uuid.UUID(organization_id),
+                    SuggestedOpportunity.title == opportunity_json["title"]
+                )
+                existing_opp = (await db.execute(existing_opp_stmt)).scalars().first()
+
+                if not existing_opp:
+                    new_opportunity = SuggestedOpportunity(
+                        organization_id=uuid.UUID(organization_id),
+                        title=opportunity_json["title"],
+                        description=opportunity_json["description"],
+                        suggested_action=opportunity_json["suggested_action"],
+                        source="LATENT_NEED_ANALYSIS"
+                    )
+                    db.add(new_opportunity)
+                    print(f"Opportunity Engine: Generated new opportunity - '{opportunity_json['title']}'")
+
+        await db.commit()
+    await engine.dispose()
+
 async def _async_validate_patterns(upload_id: str):
     """
     The async core of the pattern validation task. This function performs a
@@ -477,5 +570,6 @@ def discover_patterns_from_live_data_task(agent_id: str):
 
 @celery_app.task(name='app.background.tasks.generate_opportunities_task')
 def generate_opportunities_task(organization_id: str):
-    print(f"Opportunity generation for org {organization_id} is not yet implemented.")
-    pass
+    """Celery wrapper for the proactive opportunity engine."""
+    print(f"Starting opportunity discovery for organization ID: {organization_id}")
+    run_async_task(_async_generate_opportunities, organization_id)
