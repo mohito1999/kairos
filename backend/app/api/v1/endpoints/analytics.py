@@ -15,6 +15,7 @@ from app.models.interaction import Interaction
 from app.models.outcome import Outcome
 from app.models.learned_pattern import LearnedPattern
 from app.models.suggested_opportunity import SuggestedOpportunity
+from app.core.celery_app import celery_app
 
 
 router = APIRouter()
@@ -114,3 +115,23 @@ async def list_opportunities(
     result = await db.execute(stmt)
     opportunities = result.scalars().all()
     return [o.__dict__ for o in opportunities]
+
+@router.post("/trigger-live-learning/{agent_id}", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_live_learning_for_agent(
+    agent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    DEBUGGING ENDPOINT: Manually triggers the live learning task for an agent.
+    """
+    # Ensure agent exists and belongs to the user's organization
+    agent = await agent_service.get_agent_by_id(db, agent_id, current_user.organization_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    celery_app.send_task(
+        'app.background.tasks.discover_patterns_from_live_data_task',
+        args=[str(agent_id)]
+    )
+    return {"message": "Live learning task triggered successfully."}

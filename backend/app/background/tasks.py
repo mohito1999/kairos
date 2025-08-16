@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 from io import StringIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 
 import asyncio
@@ -68,6 +68,84 @@ def is_quality_pattern(pattern_json: dict) -> bool:
     trigger = pattern_json.get("trigger_context_summary", "").lower()
     if len(strategy.split()) < 4 or len(trigger.split()) < 3: return False
     return True
+
+async def _async_run_contrastive_engine(
+    db: AsyncSession, 
+    agent_id: uuid.UUID, 
+    interactions: List[HistoricalInteraction],
+    source: str,
+    source_upload_id: Optional[uuid.UUID] = None
+):
+    """
+    This is the refactored, reusable core of the Contrastive Engine.
+    It takes a list of interactions and discovers patterns from them.
+    """
+    failed_interactions = [i for i in interactions if not i.is_success and i.original_response]
+    if len(failed_interactions) < 5:
+        print(f"Engine: Not enough failed interactions ({len(failed_interactions)}) to run.")
+        return
+
+    # A. OPPORTUNITY DISCOVERY
+    failed_transcripts = [i.original_response for i in failed_interactions]
+    failed_embeddings_list = await embedding_service.get_embeddings(failed_transcripts)
+    valid_embeddings = [emb for emb in failed_embeddings_list if emb]
+    valid_interactions = [inter for i, inter in enumerate(failed_interactions) if failed_embeddings_list[i]]
+    if len(valid_embeddings) < 5: return
+
+    dbscan = DBSCAN(eps=0.5, min_samples=3, metric="cosine")
+    clusters = dbscan.fit_predict(np.array(valid_embeddings))
+    
+    battlegrounds = {}
+    for i, cluster_id in enumerate(clusters):
+        if cluster_id != -1: battlegrounds.setdefault(cluster_id, []).append(valid_interactions[i])
+
+    print(f"Engine: Discovered {len(battlegrounds)} battlegrounds.")
+    patterns_to_create = []
+
+    # B. CONTRASTIVE ANALYSIS
+    for cluster_id, losing_interactions in battlegrounds.items():
+        losing_centroid_embeddings = [emb for inter in losing_interactions for emb in await embedding_service.get_embeddings([inter.original_response]) if emb]
+        if not losing_centroid_embeddings: continue
+        losing_centroid = np.mean(losing_centroid_embeddings, axis=0)
+        
+        successful_interactions = [i for i in interactions if i.is_success]
+        if not successful_interactions: continue
+
+        successful_transcripts = [i.original_response for i in successful_interactions]
+        successful_embeddings = await embedding_service.get_embeddings(successful_transcripts)
+        
+        winning_interactions = [successful_interactions[i] for i, emb in enumerate(successful_embeddings) if emb and cosine_similarity([losing_centroid], [emb])[0][0] > 0.8]
+
+        if len(winning_interactions) < 2 or len(losing_interactions) < 2: continue
+
+        # C. PATTERN CREATION
+        positive_snippets = [i.original_response for i in winning_interactions[:5]]
+        negative_snippets = [i.original_response for i in losing_interactions[:5]]
+        
+        system_prompt = "You are a sales coach... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
+        user_prompt = f"FAILED SNIPPETS:\n{json.dumps(negative_snippets)}\n\nSUCCESSFUL SNIPPETS:\n{json.dumps(positive_snippets)}\n\nWhat is the battleground and the specific, winning strategy?"
+        
+        pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
+
+        if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(db, pattern_json["suggested_strategy"], agent_id):
+            patterns_to_create.append(LearnedPattern(
+                agent_id=agent_id, source=source, status="CANDIDATE", source_upload_id=source_upload_id,
+                battleground_context={"cluster_id": int(cluster_id)}, positive_examples={"transcripts": positive_snippets},
+                negative_examples={"transcripts": negative_snippets}, trigger_context_summary=pattern_json["trigger_context_summary"],
+                suggested_strategy=pattern_json["suggested_strategy"],
+            ))
+    
+    if patterns_to_create:
+        print(f"Engine: Discovered {len(patterns_to_create)} new candidate patterns from source '{source}'.")
+        db.add_all(patterns_to_create)
+        await db.commit()
+        # If this came from a historical upload, we trigger validation
+        if source_upload_id:
+            upload = await db.get(HistoricalUpload, source_upload_id)
+            if upload:
+                upload.status = "VALIDATING"
+                await db.commit()
+                celery_app.send_task('app.background.tasks.validate_patterns_task', args=[str(source_upload_id)])
 
 async def _async_process_historical_upload(upload_id: str, file_content_bytes: bytes, data_mapping: dict):
     engine = create_async_engine(settings.DATABASE_URL)
@@ -143,6 +221,7 @@ async def _async_split_historical_data(upload_id: str):
     await engine.dispose()
 
 async def _async_extract_patterns_from_history(upload_id: str):
+    """Orchestrator for historical data. Fetches data and calls the core engine."""
     engine = create_async_engine(settings.DATABASE_URL)
     AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with AsyncSessionLocal_Task() as db:
@@ -151,66 +230,49 @@ async def _async_extract_patterns_from_history(upload_id: str):
 
         training_set_ids = [uuid.UUID(id_str) for id_str in upload.interaction_id_split.get("training_set", [])]
         if not training_set_ids: upload.status = "COMPLETED"; await db.commit(); return
-
-        failed_stmt = select(HistoricalInteraction).where(HistoricalInteraction.upload_id == upload.id, HistoricalInteraction.is_success == False, HistoricalInteraction.original_response.is_not(None))
-        failed_interactions = (await db.execute(failed_stmt)).scalars().all()
-        if len(failed_interactions) < 5: upload.status = "COMPLETED"; await db.commit(); return
-
-        failed_transcripts = [i.original_response for i in failed_interactions]
-        failed_embeddings_list = await embedding_service.get_embeddings(failed_transcripts)
         
-        valid_embeddings = [emb for emb in failed_embeddings_list if emb]
-        valid_interactions = [inter for i, inter in enumerate(failed_interactions) if failed_embeddings_list[i]]
+        training_interactions = (await db.execute(select(HistoricalInteraction).where(HistoricalInteraction.id.in_(training_set_ids)))).scalars().all()
         
-        if len(valid_embeddings) < 5: upload.status = "COMPLETED"; await db.commit(); return
+        await _async_run_contrastive_engine(
+            db=db, 
+            agent_id=upload.agent_id,
+            interactions=training_interactions,
+            source="HISTORICAL_CONTRASTIVE",
+            source_upload_id=upload.id
+        )
+    await engine.dispose()
+
+async def _async_discover_patterns_from_live_data(agent_id: str):
+    """Orchestrator for live data. Fetches data and calls the core engine."""
+    engine = create_async_engine(settings.DATABASE_URL)
+    AsyncSessionLocal_Task = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with AsyncSessionLocal_Task() as db:
+        seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
         
-        dbscan = DBSCAN(eps=0.5, min_samples=3, metric="cosine")
-        clusters = dbscan.fit_predict(np.array(valid_embeddings))
+        stmt = select(Interaction).options(selectinload(Interaction.outcome)).where(
+            Interaction.agent_id == uuid.UUID(agent_id),
+            Interaction.created_at >= seven_days_ago
+        )
+        recent_interactions = (await db.execute(stmt)).scalars().all()
+
+        if len(recent_interactions) < 20:
+            print(f"Live Learning: Not enough interactions ({len(recent_interactions)}) for agent {agent_id}.")
+            return
+
+        pseudo_historical_interactions = [
+            HistoricalInteraction(
+                original_context=inter.context,
+                original_response=inter.full_transcript,
+                is_success=inter.outcome.is_success if inter.outcome else False
+            ) for inter in recent_interactions if inter.outcome
+        ]
         
-        battlegrounds = {cid: [] for cid in np.unique(clusters) if cid != -1}
-        for i, cid in enumerate(clusters):
-            if cid != -1: battlegrounds[cid].append(valid_interactions[i])
-
-        patterns_to_create = []
-        for cluster_id, losing_interactions in battlegrounds.items():
-            losing_centroid_embeddings = [emb for inter in losing_interactions for emb in await embedding_service.get_embeddings([inter.original_response]) if emb]
-            if not losing_centroid_embeddings: continue
-            losing_centroid = np.mean(losing_centroid_embeddings, axis=0)
-            
-            successful_training_stmt = select(HistoricalInteraction).where(HistoricalInteraction.id.in_(training_set_ids))
-            successful_interactions = (await db.execute(successful_training_stmt)).scalars().all()
-            if not successful_interactions: continue
-
-            successful_transcripts = [i.original_response for i in successful_interactions]
-            successful_embeddings = await embedding_service.get_embeddings(successful_transcripts)
-            
-            winning_interactions = [successful_interactions[i] for i, emb in enumerate(successful_embeddings) if emb and cosine_similarity([losing_centroid], [emb])[0][0] > 0.8]
-
-            if len(winning_interactions) < 2 or len(losing_interactions) < 2: continue
-
-            positive_snippets = [i.original_response for i in winning_interactions[:5]]
-            negative_snippets = [i.original_response for i in losing_interactions[:5]]
-            
-            system_prompt = "You are a sales coach... Distill the winning tactic into a JSON object with keys 'trigger_context_summary' and 'suggested_strategy'."
-            user_prompt = f"FAILED SNIPPETS:\n{json.dumps(negative_snippets)}\n\nSUCCESSFUL SNIPPETS:\n{json.dumps(positive_snippets)}\n\nWhat is the battleground and the specific, winning strategy?"
-            
-            pattern_json = await llm_service.get_json_response(system_prompt, user_prompt, model="openai/gpt-4o")
-
-            if pattern_json and is_quality_pattern(pattern_json) and not await is_duplicate_pattern(db, pattern_json["suggested_strategy"], upload.agent_id):
-                patterns_to_create.append(LearnedPattern(
-                    agent_id=upload.agent_id, source="HISTORICAL_CONTRASTIVE", status=PatternStatusEnum.CANDIDATE, source_upload_id=upload.id,
-                    battleground_context={"cluster_id": int(cluster_id)}, positive_examples={"transcripts": positive_snippets},
-                    negative_examples={"transcripts": negative_snippets}, trigger_context_summary=pattern_json["trigger_context_summary"],
-                    suggested_strategy=pattern_json["suggested_strategy"],
-                ))
-        
-        if patterns_to_create:
-            db.add_all(patterns_to_create)
-            upload.status = "VALIDATING"
-            await db.commit()
-            celery_app.send_task('app.background.tasks.validate_patterns_task', args=[upload_id])
-        else:
-            upload.status = "COMPLETED"; await db.commit()
+        await _async_run_contrastive_engine(
+            db=db,
+            agent_id=uuid.UUID(agent_id),
+            interactions=pseudo_historical_interactions,
+            source="LIVE_DISCOVERED"
+        )
     await engine.dispose()
 
 async def _async_validate_patterns(upload_id: str):
@@ -409,8 +471,9 @@ def process_live_outcome_task(interaction_id: str):
 
 @celery_app.task(name='app.background.tasks.discover_patterns_from_live_data_task')
 def discover_patterns_from_live_data_task(agent_id: str):
-    print(f"Live pattern discovery for agent {agent_id} is not yet implemented.")
-    pass
+    """Celery wrapper for the live learning engine."""
+    print(f"Starting live pattern discovery for agent ID: {agent_id}")
+    run_async_task(_async_discover_patterns_from_live_data, agent_id)
 
 @celery_app.task(name='app.background.tasks.generate_opportunities_task')
 def generate_opportunities_task(organization_id: str):
